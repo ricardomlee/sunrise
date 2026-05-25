@@ -342,6 +342,15 @@ async fn persist_unpaired_client(pairing: &PairingState, unique_id: &str) -> Res
 }
 
 async fn prompt_for_pin(remote: SocketAddr, unique_id: String) -> Result<String> {
+    if let Ok(pin) = std::env::var("SUNRISE_PAIRING_PIN") {
+        let pin = pin.trim().to_string();
+        if pin.is_empty() {
+            bail!("SUNRISE_PAIRING_PIN was set but empty");
+        }
+        info!(%remote, unique_id = %unique_id, "using PIN from SUNRISE_PAIRING_PIN");
+        return Ok(pin);
+    }
+
     tokio::task::spawn_blocking(move || {
         print!(
             "Moonlight pairing request from {remote} ({unique_id}). Enter the PIN shown in Moonlight: "

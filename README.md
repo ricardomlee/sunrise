@@ -49,6 +49,22 @@ It returns one fake app:
 - AppTitle: `Desktop`
 - IsHdrSupported: `0`
 
+## Automated Moonlight Smoke Test
+
+On Windows with Moonlight installed:
+
+```powershell
+.\scripts\moonlight-smoke.ps1
+```
+
+The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned.
+
+If your Moonlight install is in a different location:
+
+```powershell
+.\scripts\moonlight-smoke.ps1 -MoonlightPath "C:\Path\To\Moonlight.exe"
+```
+
 ## Test With Moonlight
 
 1. Start sunrise:
