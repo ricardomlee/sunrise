@@ -26,6 +26,7 @@ The daemon listens on:
 
 - HTTP: `0.0.0.0:47989`
 - HTTPS: `0.0.0.0:47984`
+- RTSP: `0.0.0.0:48010`
 
 ## Test Locally
 
@@ -59,6 +60,8 @@ On Windows with Moonlight installed:
 
 The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned.
 
+The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
+
 If your Moonlight install is in a different location:
 
 ```powershell
@@ -79,15 +82,25 @@ If your Moonlight install is in a different location:
 5. When sunrise prints a terminal prompt, type the PIN shown by Moonlight and press Enter.
 6. Watch the sunrise logs for `/serverinfo`, `/pair`, and `/applist` requests.
 
-The current pairing implementation is intentionally early-stage. It performs the PIN-derived AES challenge exchange and marks a client paired for the current daemon session. Client certificate signature verification and persistent paired-client storage are still TODOs.
+The current pairing implementation is intentionally early-stage. It performs the PIN-derived AES challenge exchange and persists paired client certificates. Client certificate signature verification is still TODO.
+
+## Launch And RTSP Skeleton
+
+sunrise now accepts HTTPS `/launch` for the fake `Desktop` app and returns a plain RTSP session URL. It also starts a TCP RTSP listener on port `48010` that can answer the first control-plane requests Moonlight sends when a stream starts:
+
+- `OPTIONS`
+- `DESCRIBE`
+- `SETUP`
+- `ANNOUNCE`
+- `PLAY`
+
+This is only a handshake scaffold. It advertises placeholder H.264 video and Opus audio SDP, but it does not send RTP video/audio packets yet.
 
 ## Current Limitations
 
-- Pairing is implemented only as an early in-memory handshake.
-- Client certificate storage and signature verification are not implemented.
-- The server certificate is generated in memory on startup and is not persisted yet.
-- `/launch` is not implemented.
-- RTSP is not implemented.
+- Client certificate signature verification is not implemented.
+- `/launch` is a session skeleton and does not start a real desktop capture pipeline.
+- RTSP replies are placeholders for Moonlight probing and early negotiation.
 - RTP video and audio are not implemented.
 - ENet control/input is not implemented.
 - No video capture, audio capture, NVENC, or Windows screen capture exists yet.
@@ -95,9 +108,8 @@ The current pairing implementation is intentionally early-stage. It performs the
 
 ## Next Milestones
 
-1. Add the real HTTP pairing phases and persist paired client certificates.
+1. Verify the `/launch` and RTSP skeleton against more Moonlight clients.
 2. Gate HTTPS APIs by paired client certificates.
-3. Implement `/launch` and the RTSP handshake.
+3. Add ENet control channel parsing.
 4. Add RTP video and audio transport scaffolding.
-5. Add ENet control channel parsing.
-6. Add Windows capture/encode integration only after the protocol control plane is stable.
+5. Add Windows capture/encode integration only after the protocol control plane is stable.

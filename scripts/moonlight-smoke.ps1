@@ -46,6 +46,37 @@ function Test-HasPairedClient {
     return [bool](Select-String -LiteralPath $Path -Pattern "^\[\[paired_clients\]\]" -Quiet)
 }
 
+function New-SmokeConfig {
+    param([string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        return
+    }
+
+    $uniqueId = ([guid]::NewGuid().ToString("N").Substring(0, 16)).ToUpperInvariant()
+    $uuid = [guid]::NewGuid().ToString()
+    $macBytes = [byte[]]::new(6)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($macBytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    $macBytes[0] = ($macBytes[0] -band 0xFE) -bor 0x02
+    $mac = ($macBytes | ForEach-Object { $_.ToString("X2") }) -join ":"
+
+    @"
+host_name = "sunrise-smoke"
+http_port = 47989
+https_port = 47984
+rtsp_port = 48010
+unique_id = "$uniqueId"
+uuid = "$uuid"
+mac_address = "$mac"
+"@ | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
 function Invoke-MoonlightPairUntilPaired {
     param(
         [string]$LogPath,
@@ -150,6 +181,7 @@ $listLog = Join-Path $logDir "moonlight-list.log"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 Remove-Item -LiteralPath $daemonLog, $pairLog, $listLog -ErrorAction SilentlyContinue
+New-SmokeConfig -Path $ConfigPath
 
 Push-Location $repoRoot
 try {

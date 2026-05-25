@@ -1,5 +1,6 @@
 mod identity;
 mod pairing;
+mod rtsp;
 mod tls;
 
 use std::{
@@ -33,6 +34,7 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<Mutex<SunriseConfig>>,
     pub(crate) local_ip: Arc<String>,
     pub(crate) pairing: PairingState,
+    pub(crate) current_game: Arc<Mutex<u32>>,
 }
 
 #[tokio::main]
@@ -70,6 +72,7 @@ async fn main() -> Result<()> {
     let local_ip = detect_local_ip();
     let http_port = config.http_port;
     let https_port = config.https_port;
+    let rtsp_port = config.rtsp_port;
     let paired_clients = config
         .paired_clients
         .iter()
@@ -88,17 +91,21 @@ async fn main() -> Result<()> {
         config: Arc::clone(&shared_config),
         local_ip: Arc::new(local_ip),
         pairing,
+        current_game: Arc::new(Mutex::new(0)),
     };
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
     let https_addr = SocketAddr::from(([0, 0, 0, 0], https_port));
+    let rtsp_addr = SocketAddr::from(([0, 0, 0, 0], rtsp_port));
 
     let http = serve_http(http_addr, state.clone());
-    let https = tls::serve_https(https_addr, identity, state);
+    let https = tls::serve_https(https_addr, identity, state.clone());
+    let rtsp = rtsp::serve_rtsp(rtsp_addr, state);
 
     tokio::select! {
         result = http => result,
         result = https => result,
+        result = rtsp => result,
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to listen for ctrl-c")?;
             info!("shutdown requested");
@@ -179,7 +186,11 @@ async fn render_serverinfo(state: &AppState, client_unique_id: Option<&str>) -> 
         None => false,
     };
     let config = state.config.lock().await;
-    let info = ServerInfo::from_config(&config, state.local_ip.as_str(), paired);
+    let mut info = ServerInfo::from_config(&config, state.local_ip.as_str(), paired);
+    info.current_game = *state.current_game.lock().await;
+    if info.current_game != 0 {
+        info.state = "SUNSHINE_SERVER_BUSY".to_string();
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],

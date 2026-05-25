@@ -1,7 +1,7 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::IpAddr, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use sunrise_protocol::{ServerInfo, applist_xml, pair_xml, serverinfo_xml};
+use sunrise_protocol::{ServerInfo, applist_xml, cancel_xml, launch_xml, pair_xml, serverinfo_xml};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -27,8 +27,8 @@ pub async fn serve_https(
     info!("TODO: persist server certificate and paired Moonlight client certificates");
     info!("TODO: implement strict client certificate verification for HTTPS");
     info!("TODO: store paired Moonlight client certificates");
-    info!("TODO: implement /launch");
-    info!("TODO: implement RTSP");
+    info!("TODO: connect /launch to real app/session lifecycle");
+    info!("TODO: replace RTSP skeleton with negotiated stream setup");
     info!("TODO: implement RTP video");
     info!("TODO: implement RTP audio");
     info!("TODO: implement ENet control");
@@ -81,12 +81,28 @@ async fn handle_tls_connection(
             None => false,
         };
         let config = state.config.lock().await;
-        let info = ServerInfo::from_config(&config, state.local_ip.as_str(), paired);
+        let mut info = ServerInfo::from_config(&config, state.local_ip.as_str(), paired);
+        info.current_game = *state.current_game.lock().await;
+        if info.current_game != 0 {
+            info.state = "SUNSHINE_SERVER_BUSY".to_string();
+        }
         info!(paired = paired, "HTTPS serverinfo requested");
         ("200 OK", serverinfo_xml(&info))
     } else if method == "GET" && path == "/applist" {
         info!("applist requested");
         ("200 OK", applist_xml())
+    } else if method == "GET" && path == "/launch" {
+        let app_id = query_value(query, "appid")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1);
+        *state.current_game.lock().await = app_id;
+        let rtsp_url = rtsp_session_url(remote, &state).await;
+        info!(app_id, %rtsp_url, "launch requested");
+        ("200 OK", launch_xml(&rtsp_url))
+    } else if method == "GET" && path == "/cancel" {
+        *state.current_game.lock().await = 0;
+        info!("cancel requested");
+        ("200 OK", cancel_xml())
     } else if method == "GET" && path == "/pair" && query.contains("phrase=pairchallenge") {
         info!("HTTPS pairchallenge requested");
         ("200 OK", pair_xml([("paired", "1")]))
@@ -120,4 +136,21 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (name, value) = pair.split_once('=')?;
         (name == key).then_some(value)
     })
+}
+
+async fn rtsp_session_url(remote: SocketAddr, state: &AppState) -> String {
+    let config = state.config.lock().await;
+    let host = if remote.ip().is_loopback() {
+        remote.ip().to_string()
+    } else {
+        state.local_ip.to_string()
+    };
+    format!("rtsp://{}:{}", format_rtsp_host(&host), config.rtsp_port)
+}
+
+fn format_rtsp_host(host: &str) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_string(),
+    }
 }

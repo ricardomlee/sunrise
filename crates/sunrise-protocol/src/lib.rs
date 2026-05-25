@@ -112,6 +112,23 @@ pub fn applist_xml() -> String {
     .join("\n")
 }
 
+pub fn launch_xml(session_url: &str) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str("<root status_code=\"200\" status_message=\"OK\">\n");
+    xml.push_str("  <gamesession>1</gamesession>\n");
+    xml.push_str("  <sessionUrl0>");
+    xml.push_str(&escape_xml(session_url));
+    xml.push_str("</sessionUrl0>\n");
+    xml.push_str("  <resume>0</resume>\n");
+    xml.push_str("</root>\n");
+    xml
+}
+
+pub fn cancel_xml() -> String {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root status_code=\"200\" status_message=\"OK\" />\n"
+        .to_string()
+}
+
 pub fn pair_xml<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<root status_code=\"200\">\n");
@@ -210,6 +227,15 @@ mod tests {
         assert!(xml.contains("<IsHdrSupported>0</IsHdrSupported>"));
         assert!(xml.contains("<ShortName>desktop</ShortName>"));
         assert!(xml.contains("<SupportedSOPS>"));
+    }
+
+    #[test]
+    fn launch_xml_contains_rtsp_session_url() {
+        let xml = launch_xml("rtsp://192.0.2.10:48010");
+
+        assert!(xml.contains("status_code=\"200\""));
+        assert!(xml.contains("<sessionUrl0>rtsp://192.0.2.10:48010</sessionUrl0>"));
+        assert!(xml.contains("<gamesession>1</gamesession>"));
     }
 
     #[test]
