@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/sunrise-config",
+    "crates/sunrise-daemon",
+    "crates/sunrise-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ricar/sunrise"
+rust-version = "1.85"
