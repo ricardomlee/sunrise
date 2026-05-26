@@ -22,4 +22,5 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "io-uti
 tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusty_enet = "0.4"
 x509-parser = "0.17"

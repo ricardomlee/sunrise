@@ -1,3 +1,4 @@
+mod control;
 mod identity;
 mod pairing;
 mod rtsp;

@@ -10,7 +10,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::AppState;
+use crate::{AppState, control};
 
 const SESSION_ID: &str = "DEADBEEFCAFE";
 const MAX_RTSP_REQUEST_BYTES: usize = 1024 * 1024;
@@ -120,7 +120,7 @@ async fn handle_rtsp_connection(
 struct RtspSessionState {
     video_socket: Option<Arc<UdpSocket>>,
     audio_socket: Option<Arc<UdpSocket>>,
-    control_socket: Option<Arc<UdpSocket>>,
+    control_task: Option<JoinHandle<()>>,
     stream_tasks: Vec<JoinHandle<()>>,
     streams_started: bool,
 }
@@ -137,9 +137,9 @@ impl RtspState {
                 session.audio_socket = Some(Arc::new(bind_udp_port(AUDIO_PORT).await?));
                 info!(port = AUDIO_PORT, "audio RTP UDP port ready");
             }
-            MediaKind::Control if session.control_socket.is_none() => {
-                session.control_socket = Some(Arc::new(bind_udp_port(CONTROL_PORT).await?));
-                info!(port = CONTROL_PORT, "control UDP port ready");
+            MediaKind::Control if session.control_task.is_none() => {
+                session.control_task = Some(control::spawn_control_server(CONTROL_PORT)?);
+                info!(port = CONTROL_PORT, "ENet control UDP port ready");
             }
             _ => {}
         }
@@ -178,7 +178,9 @@ impl RtspState {
         session.streams_started = false;
         session.video_socket = None;
         session.audio_socket = None;
-        session.control_socket = None;
+        if let Some(task) = session.control_task.take() {
+            task.abort();
+        }
     }
 }
 
