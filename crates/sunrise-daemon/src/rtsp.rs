@@ -25,6 +25,12 @@ impl RtspRequest {
     fn cseq(&self) -> &str {
         self.headers.get("cseq").map(String::as_str).unwrap_or("1")
     }
+
+    fn should_close(&self) -> bool {
+        self.headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+    }
 }
 
 pub async fn serve_rtsp(addr: SocketAddr, state: AppState) -> Result<()> {
@@ -51,64 +57,78 @@ async fn handle_rtsp_connection(
     remote: SocketAddr,
     state: AppState,
 ) -> Result<()> {
-    let request = read_rtsp_request(&mut stream).await?;
-    info!(
-        %remote,
-        method = %request.method,
-        target = %request.target,
-        cseq = %request.cseq(),
-        payload_len = request.payload.len(),
-        "incoming RTSP request"
-    );
-
     let source_ip = if remote.ip().is_loopback() {
         remote.ip().to_string()
     } else {
         state.local_ip.to_string()
     };
-    let response = rtsp_response(&request, &source_ip);
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .context("failed to write RTSP response")?;
+    let mut buffer = Vec::new();
+
+    while let Some(request) = read_rtsp_request(&mut stream, &mut buffer).await? {
+        info!(
+            %remote,
+            method = %request.method,
+            target = %request.target,
+            cseq = %request.cseq(),
+            payload_len = request.payload.len(),
+            "incoming RTSP request"
+        );
+
+        let should_close = request.should_close() || request.method == "TEARDOWN";
+        let response = rtsp_response(&request, &source_ip, should_close);
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("failed to write RTSP response")?;
+
+        if should_close {
+            break;
+        }
+    }
+
     stream.shutdown().await.ok();
     Ok(())
 }
 
-async fn read_rtsp_request(stream: &mut TcpStream) -> Result<RtspRequest> {
-    let mut buffer = Vec::new();
+async fn read_rtsp_request(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<RtspRequest>> {
     let mut scratch = [0_u8; 4096];
 
     loop {
+        if let Some(request_len) = complete_request_len(buffer)? {
+            let raw = buffer.drain(..request_len).collect::<Vec<_>>();
+            return Ok(Some(parse_rtsp_request(&raw)?));
+        }
+
         let bytes_read = timeout(Duration::from_secs(5), stream.read(&mut scratch))
             .await
             .context("timed out reading RTSP request")?
             .context("failed to read RTSP request")?;
         if bytes_read == 0 {
-            break;
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            bail!("RTSP connection closed with incomplete request");
         }
 
         buffer.extend_from_slice(&scratch[..bytes_read]);
         if buffer.len() > MAX_RTSP_REQUEST_BYTES {
             bail!("RTSP request exceeded maximum size");
         }
-
-        if request_complete(&buffer)? {
-            break;
-        }
     }
-
-    parse_rtsp_request(&buffer)
 }
 
-fn request_complete(buffer: &[u8]) -> Result<bool> {
+fn complete_request_len(buffer: &[u8]) -> Result<Option<usize>> {
     let Some(header_end) = find_header_end(buffer) else {
-        return Ok(false);
+        return Ok(None);
     };
     let headers = std::str::from_utf8(&buffer[..header_end])
         .context("RTSP request headers were not UTF-8")?;
     let content_length = content_length(headers)?;
-    Ok(buffer.len() >= header_end + 4 + content_length)
+    let request_len = header_end + 4 + content_length;
+    Ok((buffer.len() >= request_len).then_some(request_len))
 }
 
 fn parse_rtsp_request(raw: &[u8]) -> Result<RtspRequest> {
@@ -163,15 +183,19 @@ fn parse_rtsp_request(raw: &[u8]) -> Result<RtspRequest> {
     })
 }
 
-fn rtsp_response(request: &RtspRequest, source_ip: &str) -> String {
+fn rtsp_response(request: &RtspRequest, source_ip: &str, close_connection: bool) -> String {
     match request.method.as_str() {
         "OPTIONS" => response(
             request.cseq(),
             &[
-                ("Public", "OPTIONS, DESCRIBE, SETUP, ANNOUNCE, PLAY"),
+                (
+                    "Public",
+                    "OPTIONS, DESCRIBE, SETUP, ANNOUNCE, PLAY, GET_PARAMETER, TEARDOWN",
+                ),
                 ("Session", SESSION_ID),
             ],
             "",
+            close_connection,
         ),
         "DESCRIBE" => {
             let payload = describe_sdp(source_ip);
@@ -179,6 +203,7 @@ fn rtsp_response(request: &RtspRequest, source_ip: &str) -> String {
                 request.cseq(),
                 &[("Content-Type", "application/sdp"), ("Session", SESSION_ID)],
                 &payload,
+                close_connection,
             )
         }
         "SETUP" => {
@@ -191,12 +216,14 @@ fn rtsp_response(request: &RtspRequest, source_ip: &str) -> String {
                     ("Transport", transport.as_str()),
                 ],
                 "",
+                close_connection,
             )
         }
-        "ANNOUNCE" | "PLAY" => response(
+        "ANNOUNCE" | "PLAY" | "GET_PARAMETER" | "TEARDOWN" => response(
             request.cseq(),
             &[("Session", &format!("{SESSION_ID};timeout=90"))],
             "",
+            close_connection,
         ),
         method => {
             warn!(method, "unsupported RTSP method");
@@ -208,7 +235,7 @@ fn rtsp_response(request: &RtspRequest, source_ip: &str) -> String {
     }
 }
 
-fn response(cseq: &str, headers: &[(&str, &str)], payload: &str) -> String {
+fn response(cseq: &str, headers: &[(&str, &str)], payload: &str, close_connection: bool) -> String {
     let mut response = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n");
     for (name, value) in headers {
         response.push_str(name);
@@ -221,7 +248,11 @@ fn response(cseq: &str, headers: &[(&str, &str)], payload: &str) -> String {
         response.push_str(&payload.len().to_string());
         response.push_str("\r\n");
     }
-    response.push_str("Connection: close\r\n\r\n");
+    response.push_str(if close_connection {
+        "Connection: close\r\n\r\n"
+    } else {
+        "Connection: keep-alive\r\n\r\n"
+    });
     response.push_str(payload);
     response
 }
@@ -302,7 +333,7 @@ mod tests {
             parse_rtsp_request(b"DESCRIBE rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 2\r\n\r\n")
                 .unwrap();
 
-        let response = rtsp_response(&request, "127.0.0.1");
+        let response = rtsp_response(&request, "127.0.0.1", false);
 
         assert!(response.starts_with("RTSP/1.0 200 OK\r\n"));
         assert!(response.contains("CSeq: 2\r\n"));
@@ -315,11 +346,39 @@ mod tests {
         let request =
             parse_rtsp_request(b"SETUP streamid=audio RTSP/1.0\r\nCSeq: 3\r\n\r\n").unwrap();
 
-        let response = rtsp_response(&request, "192.0.2.10");
+        let response = rtsp_response(&request, "192.0.2.10", false);
 
         assert!(response.contains("Session: DEADBEEFCAFE;timeout=90\r\n"));
         assert!(
             response.contains("Transport: unicast;server_port=48000-48001;source=192.0.2.10\r\n")
         );
+    }
+
+    #[test]
+    fn detects_complete_pipelined_request_without_consuming_followup() {
+        let buffer = b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\nDESCRIBE rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+
+        let request_len = complete_request_len(buffer).unwrap().unwrap();
+
+        assert_eq!(
+            std::str::from_utf8(&buffer[..request_len]).unwrap(),
+            "OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+        );
+        assert!(
+            std::str::from_utf8(&buffer[request_len..])
+                .unwrap()
+                .starts_with("DESCRIBE")
+        );
+    }
+
+    #[test]
+    fn keep_alive_is_default_for_rtsp_responses() {
+        let request =
+            parse_rtsp_request(b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+                .unwrap();
+
+        let response = rtsp_response(&request, "127.0.0.1", false);
+
+        assert!(response.contains("Connection: keep-alive\r\n"));
     }
 }

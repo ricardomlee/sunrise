@@ -168,6 +168,78 @@ function Invoke-MoonlightListUntilDesktop {
     }
 }
 
+function Read-RtspResponse {
+    param([System.Net.Sockets.NetworkStream]$Stream)
+
+    $bytes = [System.Collections.Generic.List[byte]]::new()
+    $buffer = [byte[]]::new(4096)
+
+    while ($true) {
+        $read = $Stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) {
+            break
+        }
+
+        for ($i = 0; $i -lt $read; $i++) {
+            $bytes.Add($buffer[$i])
+        }
+
+        $text = [System.Text.Encoding]::ASCII.GetString($bytes.ToArray())
+        $headerEnd = $text.IndexOf("`r`n`r`n")
+        if ($headerEnd -lt 0) {
+            continue
+        }
+
+        $contentLength = 0
+        foreach ($line in $text.Substring(0, $headerEnd).Split("`r`n")) {
+            if ($line -match "^\s*Content-Length\s*:\s*(\d+)\s*$") {
+                $contentLength = [int]$Matches[1]
+            }
+        }
+
+        $expectedLength = $headerEnd + 4 + $contentLength
+        if ($bytes.Count -ge $expectedLength) {
+            return [System.Text.Encoding]::ASCII.GetString($bytes.ToArray(), 0, $expectedLength)
+        }
+    }
+
+    throw "RTSP connection closed before a complete response was read"
+}
+
+function Invoke-LaunchAndRtspSmoke {
+    $launchUrl = "https://$HostAddress`:47984/launch?uniqueid=0123456789ABCDEF&uuid=smoke&appid=1&mode=1920x1080x60&rikey=00112233445566778899AABBCCDDEEFF&rikeyid=1"
+    $launchResponse = (curl.exe -sk $launchUrl) -join "`n"
+    if ($launchResponse -notmatch "<sessionUrl0>rtsp://$([regex]::Escape($HostAddress)):48010</sessionUrl0>") {
+        throw "Launch response did not advertise the expected RTSP URL: $launchResponse"
+    }
+
+    $client = [System.Net.Sockets.TcpClient]::new($HostAddress, 48010)
+    $client.ReceiveTimeout = 5000
+    $client.SendTimeout = 5000
+    try {
+        $stream = $client.GetStream()
+
+        $options = [System.Text.Encoding]::ASCII.GetBytes("OPTIONS rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 1`r`n`r`n")
+        $stream.Write($options, 0, $options.Length)
+        $optionsResponse = Read-RtspResponse -Stream $stream
+        if ($optionsResponse -notmatch "RTSP/1.0 200 OK" -or $optionsResponse -notmatch "Connection: keep-alive") {
+            throw "Unexpected RTSP OPTIONS response: $optionsResponse"
+        }
+
+        $describe = [System.Text.Encoding]::ASCII.GetBytes("DESCRIBE rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 2`r`nAccept: application/sdp`r`n`r`n")
+        $stream.Write($describe, 0, $describe.Length)
+        $describeResponse = Read-RtspResponse -Stream $stream
+        if ($describeResponse -notmatch "a=rtpmap:96 H264/90000" -or $describeResponse -notmatch "a=rtpmap:97 opus/48000/2") {
+            throw "Unexpected RTSP DESCRIBE response: $describeResponse"
+        }
+    }
+    finally {
+        $client.Close()
+    }
+
+    Write-Host "Launch and RTSP smoke passed."
+}
+
 if (!(Test-Path -LiteralPath $MoonlightPath)) {
     throw "Moonlight.exe not found at $MoonlightPath"
 }
@@ -209,6 +281,7 @@ try {
         }
 
         Invoke-MoonlightListUntilDesktop -LogPath $listLog
+        Invoke-LaunchAndRtspSmoke
     }
     finally {
         Pop-Location
