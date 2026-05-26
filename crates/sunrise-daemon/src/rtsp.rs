@@ -488,8 +488,7 @@ fn split_annex_b_access_units(data: &[u8]) -> Vec<Vec<u8>> {
         let starts_picture = unit_type.is_some_and(|unit_type| unit_type == 1 || unit_type == 5);
         let starts_new_picture =
             starts_picture && slice_first_mb.map_or(current_has_picture, |first_mb| first_mb == 0);
-        let starts_next_header =
-            current_has_picture && matches!(unit_type, Some(6 | 7 | 8 | 9));
+        let starts_next_header = current_has_picture && matches!(unit_type, Some(6 | 7 | 8 | 9));
 
         if starts_next_header || (starts_new_picture && current_has_picture) {
             frames.push(std::mem::take(&mut current));
@@ -578,7 +577,11 @@ fn rbsp_without_emulation_prevention(payload: &[u8]) -> Vec<u8> {
         }
 
         rbsp.push(byte);
-        zero_run = if byte == 0 { zero_run.saturating_add(1) } else { 0 };
+        zero_run = if byte == 0 {
+            zero_run.saturating_add(1)
+        } else {
+            0
+        };
     }
 
     rbsp
@@ -899,8 +902,8 @@ mod tests {
     #[test]
     fn groups_h264_headers_with_following_picture() {
         let frames = split_annex_b_access_units(&[
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4, 0, 0, 0, 1, 0x65, 0x80, 6, 0, 0, 1,
-            0x41, 0x80, 8,
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4, 0, 0, 0, 1, 0x65, 0x80, 6, 0, 0, 1, 0x41,
+            0x80, 8,
         ]);
 
         assert_eq!(frames.len(), 2);
@@ -912,8 +915,8 @@ mod tests {
     #[test]
     fn keeps_multiple_h264_slices_in_one_access_unit() {
         let frames = split_annex_b_access_units(&[
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4, 0, 0, 1, 0x65, 0x80, 0, 0, 1, 0x65,
-            0x40, 0, 0, 1, 0x65, 0x60, 0, 0, 1, 0x41, 0x80, 0, 0, 1, 0x41, 0x40,
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4, 0, 0, 1, 0x65, 0x80, 0, 0, 1, 0x65, 0x40,
+            0, 0, 1, 0x65, 0x60, 0, 0, 1, 0x41, 0x80, 0, 0, 1, 0x41, 0x40,
         ]);
 
         assert_eq!(frames.len(), 2);

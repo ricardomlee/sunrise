@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256, RsaKeySize, SigningKey,
+    date_time_ymd,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sunrise_config::SunriseConfig;
@@ -42,6 +43,8 @@ impl ServerIdentity {
             "127.0.0.1".to_string(),
         ])
         .context("failed to create certificate parameters")?;
+        params.not_before = date_time_ymd(2024, 1, 1);
+        params.not_after = date_time_ymd(2046, 1, 1);
         let mut distinguished_name = DistinguishedName::new();
         distinguished_name.push(DnType::CommonName, &config.host_name);
         params.distinguished_name = distinguished_name;

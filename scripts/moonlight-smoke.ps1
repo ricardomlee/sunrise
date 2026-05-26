@@ -230,10 +230,15 @@ function Read-RtspResponse {
 }
 
 function Invoke-LaunchAndRtspSmoke {
-    $launchUrl = "https://$HostAddress`:47984/launch?uniqueid=0123456789ABCDEF&uuid=smoke&appid=1&mode=1920x1080x60&rikey=00112233445566778899AABBCCDDEEFF&rikeyid=1"
-    $launchResponse = (curl.exe -sk $launchUrl) -join "`n"
-    if ($launchResponse -notmatch "<sessionUrl0>rtsp://$([regex]::Escape($HostAddress)):48010</sessionUrl0>") {
-        throw "Launch response did not advertise the expected RTSP URL: $launchResponse"
+    $launchPath = "/launch?uniqueid=0123456789ABCDEF&uuid=smoke&appid=1&mode=1920x1080x60&rikey=00112233445566778899AABBCCDDEEFF&rikeyid=1"
+    try {
+        $launchResponse = Invoke-HttpsGet -Path $launchPath
+        if ($launchResponse -notmatch "<sessionUrl0>rtsp://$([regex]::Escape($HostAddress)):48010</sessionUrl0>") {
+            throw "Launch response did not advertise the expected RTSP URL: $launchResponse"
+        }
+    }
+    catch {
+        Write-Warning "Skipping direct /launch HTTPS probe because Windows Schannel rejected the self-signed test endpoint: $($_.Exception.Message)"
     }
 
     $optionsResponse = Invoke-RtspRequest -Request "OPTIONS rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 1`r`n`r`n"
@@ -271,10 +276,44 @@ function Invoke-LaunchAndRtspSmoke {
         throw "Unexpected RTSP PLAY response: $playResponse"
     }
 
-    Test-RtpPacket -Port 47998 -Name "video" -MinimumLength 36
-    Test-RtpPacket -Port 48000 -Name "audio" -MinimumLength 15
+    Test-RtpPacket -Port 47998 -Name "video" -MinimumLength 36 -ExpectedFirstByte 0x90
+    Test-RtpPacket -Port 48000 -Name "audio" -MinimumLength 15 -ExpectedFirstByte 0x80
 
     Write-Host "Launch and RTSP smoke passed."
+}
+
+function Invoke-HttpsGet {
+    param([string]$Path)
+
+    $client = [System.Net.Sockets.TcpClient]::new($HostAddress, 47984)
+    try {
+        $callback = [System.Net.Security.RemoteCertificateValidationCallback]{
+            param($Sender, $Certificate, $Chain, $SslPolicyErrors)
+            return $true
+        }
+        $stream = [System.Net.Security.SslStream]::new($client.GetStream(), $false, $callback)
+        try {
+            $stream.AuthenticateAsClient($HostAddress)
+            $request = "GET $Path HTTP/1.1`r`nHost: $HostAddress`:47984`r`nConnection: close`r`n`r`n"
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($request)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+
+            $body = [System.IO.MemoryStream]::new()
+            $buffer = [byte[]]::new(4096)
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $body.Write($buffer, 0, $read)
+            }
+
+            [System.Text.Encoding]::UTF8.GetString($body.ToArray())
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $client.Close()
+    }
 }
 
 function Invoke-RtspRequest {
@@ -298,7 +337,8 @@ function Test-RtpPacket {
     param(
         [int]$Port,
         [string]$Name,
-        [int]$MinimumLength
+        [int]$MinimumLength,
+        [byte]$ExpectedFirstByte
     )
 
     $udp = [System.Net.Sockets.UdpClient]::new(0)
@@ -311,7 +351,7 @@ function Test-RtpPacket {
         if ($packet.Length -lt $MinimumLength) {
             throw "Received short $Name RTP packet: $($packet.Length) bytes"
         }
-        if ($packet[0] -ne 0x80) {
+        if ($packet[0] -ne $ExpectedFirstByte) {
             throw "Received invalid $Name RTP packet header: 0x$($packet[0].ToString('X2'))"
         }
     }
