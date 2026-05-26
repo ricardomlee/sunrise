@@ -91,13 +91,13 @@ async fn handle_tls_connection(
     } else if method == "GET" && path == "/applist" {
         info!("applist requested");
         ("200 OK", applist_xml())
-    } else if method == "GET" && path == "/launch" {
+    } else if method == "GET" && (path == "/launch" || path == "/resume") {
         let app_id = query_value(query, "appid")
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
         *state.current_game.lock().await = app_id;
         let rtsp_url = rtsp_session_url(remote, &state).await;
-        info!(app_id, %rtsp_url, "launch requested");
+        info!(app_id, %rtsp_url, route = %path, "launch/resume requested");
         ("200 OK", launch_xml(&rtsp_url))
     } else if method == "GET" && path == "/cancel" {
         *state.current_game.lock().await = 0;

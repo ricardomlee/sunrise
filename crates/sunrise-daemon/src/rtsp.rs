@@ -19,9 +19,10 @@ const AUDIO_PORT: u16 = 48000;
 const CONTROL_PORT: u16 = 47999;
 const RTP_VIDEO_PAYLOAD_TYPE: u8 = 96;
 const RTP_AUDIO_PAYLOAD_TYPE: u8 = 97;
-const RTP_VIDEO_HEADER_LEN: usize = 28;
+const RTP_VIDEO_HEADER_LEN: usize = 32;
+const NV_VIDEO_HEADER_LEN: usize = 16;
 const RTP_AUDIO_HEADER_LEN: usize = 12;
-const STREAM_PACKET_PAYLOAD_SIZE: usize = 1024;
+const VIDEO_PACKET_SIZE: usize = 1024;
 const VIDEO_MAGIC: &[u8; 8] = b"\x017charss";
 
 #[derive(Clone, Default)]
@@ -456,7 +457,7 @@ fn load_h264_frames() -> Vec<Vec<u8>> {
 
     match fs::read(&path) {
         Ok(data) => {
-            let frames = split_annex_b_units(&data);
+            let frames = split_annex_b_access_units(&data);
             if frames.is_empty() {
                 warn!(%path, "H.264 source contained no Annex B NAL units; using raw file as one frame");
                 vec![data]
@@ -470,6 +471,31 @@ fn load_h264_frames() -> Vec<Vec<u8>> {
             vec![fallback_h264_frame()]
         }
     }
+}
+
+fn split_annex_b_access_units(data: &[u8]) -> Vec<Vec<u8>> {
+    let units = split_annex_b_units(data);
+    let mut frames = Vec::new();
+    let mut current = Vec::new();
+    let mut current_has_picture = false;
+
+    for unit in units {
+        let starts_picture =
+            nal_unit_type(&unit).is_some_and(|unit_type| unit_type == 1 || unit_type == 5);
+        if starts_picture && current_has_picture {
+            frames.push(std::mem::take(&mut current));
+            current_has_picture = false;
+        }
+
+        current.extend_from_slice(&unit);
+        current_has_picture |= starts_picture;
+    }
+
+    if !current.is_empty() {
+        frames.push(current);
+    }
+
+    frames
 }
 
 fn split_annex_b_units(data: &[u8]) -> Vec<Vec<u8>> {
@@ -505,6 +531,17 @@ fn annex_b_start_codes(data: &[u8]) -> Vec<usize> {
     starts
 }
 
+fn nal_unit_type(unit: &[u8]) -> Option<u8> {
+    let header = if unit.starts_with(&[0, 0, 0, 1]) {
+        unit.get(4)
+    } else if unit.starts_with(&[0, 0, 1]) {
+        unit.get(3)
+    } else {
+        None
+    }?;
+    Some(header & 0x1F)
+}
+
 fn fallback_h264_frame() -> Vec<u8> {
     vec![
         0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0x8d, 0x68, 0x50, 0x1e, 0xd0, 0x0f, 0x12,
@@ -519,8 +556,8 @@ fn build_video_rtp_packets(
     sequence: &mut u16,
     timestamp: u32,
 ) -> Vec<Vec<u8>> {
-    let first_payload_size = STREAM_PACKET_PAYLOAD_SIZE - RTP_VIDEO_HEADER_LEN - VIDEO_MAGIC.len();
-    let regular_payload_size = STREAM_PACKET_PAYLOAD_SIZE - RTP_VIDEO_HEADER_LEN;
+    let first_payload_size = VIDEO_PACKET_SIZE - NV_VIDEO_HEADER_LEN - VIDEO_MAGIC.len();
+    let regular_payload_size = VIDEO_PACKET_SIZE - NV_VIDEO_HEADER_LEN;
     let mut chunks = Vec::new();
     let mut offset = 0;
     let mut first = true;
@@ -543,6 +580,7 @@ fn build_video_rtp_packets(
             *sequence,
             timestamp,
             0x5253_5650,
+            true,
         );
         append_nv_video_header(
             &mut packet,
@@ -573,6 +611,7 @@ fn build_audio_rtp_packet(sequence: u16, timestamp: u32, payload: &[u8]) -> Vec<
         sequence,
         timestamp,
         0x5253_4150,
+        false,
     );
     packet.extend_from_slice(payload);
     packet
@@ -584,12 +623,17 @@ fn append_rtp_header(
     sequence: u16,
     timestamp: u32,
     ssrc: u32,
+    extension: bool,
 ) {
-    packet.push(0x80);
+    packet.push(if extension { 0x90 } else { 0x80 });
     packet.push(payload_type);
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&timestamp.to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
+    if extension {
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+    }
 }
 
 fn append_nv_video_header(
@@ -598,13 +642,13 @@ fn append_nv_video_header(
     frame_index: u32,
     flags: u8,
 ) {
-    packet.extend_from_slice(&stream_packet_index.to_be_bytes());
-    packet.extend_from_slice(&frame_index.to_be_bytes());
+    packet.extend_from_slice(&stream_packet_index.to_le_bytes());
+    packet.extend_from_slice(&frame_index.to_le_bytes());
     packet.push(flags);
     packet.push(0);
     packet.push(0);
     packet.push(0);
-    packet.extend_from_slice(&0_u32.to_be_bytes());
+    packet.extend_from_slice(&0_u32.to_le_bytes());
 }
 
 fn video_flags(first: bool, last: bool) -> u8 {
@@ -746,6 +790,19 @@ mod tests {
     }
 
     #[test]
+    fn groups_h264_headers_with_following_picture() {
+        let frames = split_annex_b_access_units(&[
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4, 0, 0, 0, 1, 0x65, 5, 6, 0, 0, 1, 0x41, 7,
+            8,
+        ]);
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].starts_with(&[0, 0, 0, 1, 0x67]));
+        assert!(frames[0].ends_with(&[0, 0, 0, 1, 0x65, 5, 6]));
+        assert_eq!(frames[1], vec![0, 0, 1, 0x41, 7, 8]);
+    }
+
+    #[test]
     fn builds_video_rtp_packet_with_nv_header_and_magic() {
         let mut packet_index = 0;
         let mut sequence = 1;
@@ -758,10 +815,11 @@ mod tests {
         );
 
         assert_eq!(packets.len(), 1);
-        assert_eq!(&packets[0][..2], &[0x80, RTP_VIDEO_PAYLOAD_TYPE]);
-        assert_eq!(&packets[0][12..16], &0_u32.to_be_bytes());
-        assert_eq!(&packets[0][16..20], &7_u32.to_be_bytes());
-        assert_eq!(packets[0][20], 0x01 | 0x02 | 0x04);
+        assert_eq!(&packets[0][..2], &[0x90, RTP_VIDEO_PAYLOAD_TYPE]);
+        assert_eq!(&packets[0][12..16], &[0, 0, 0, 0]);
+        assert_eq!(&packets[0][16..20], &0_u32.to_le_bytes());
+        assert_eq!(&packets[0][20..24], &7_u32.to_le_bytes());
+        assert_eq!(packets[0][24], 0x01 | 0x02 | 0x04);
         assert_eq!(
             &packets[0][RTP_VIDEO_HEADER_LEN..RTP_VIDEO_HEADER_LEN + 8],
             VIDEO_MAGIC

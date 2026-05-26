@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use rusty_enet::{Event, Host, HostSettings, Packet, Peer};
+use rusty_enet::{Event, Host, HostSettings};
 use tokio::{task::JoinHandle, time::interval};
 use tracing::{debug, info, warn};
 
@@ -13,8 +13,6 @@ const CONTROL_PEERS: usize = 8;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type ControlHost = Host<StdUdpSocket>;
-type ControlPeer = Peer<StdUdpSocket>;
-
 pub(crate) fn spawn_control_server(port: u16) -> Result<JoinHandle<()>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let host = control_host(addr)?;
@@ -62,7 +60,6 @@ fn handle_control_event(event: Event<StdUdpSocket>) -> Result<()> {
         Event::Connect { peer, data } => {
             let peer_id = peer.id();
             info!(?peer_id, data, "ENet control client connected");
-            send_control_marker(peer, b"SUNRISE-CONTROL-READY")?;
         }
         Event::Disconnect { peer, data } => {
             let peer_id = peer.id();
@@ -80,16 +77,9 @@ fn handle_control_event(event: Event<StdUdpSocket>) -> Result<()> {
                 len = packet.data().len(),
                 "received ENet control packet"
             );
-            send_control_marker(peer, b"SUNRISE-CONTROL-ACK")?;
         }
     }
     Ok(())
-}
-
-fn send_control_marker(peer: &mut ControlPeer, payload: &[u8]) -> Result<()> {
-    let packet = Packet::reliable(payload);
-    peer.send(0, &packet)
-        .map_err(|err| anyhow!("failed to queue ENet control marker: {err:?}"))
 }
 
 #[cfg(test)]
@@ -135,9 +125,6 @@ mod tests {
                 match event {
                     Event::Connect { peer, .. } if peer.id() == client_peer => {
                         client_connected = true;
-                    }
-                    Event::Receive { packet, .. } => {
-                        assert!(packet.data().starts_with(b"SUNRISE-CONTROL-"));
                     }
                     _ => {}
                 }

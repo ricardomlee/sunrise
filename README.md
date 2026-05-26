@@ -103,15 +103,16 @@ sunrise now accepts HTTPS `/launch` for the fake `Desktop` app and returns a pla
 - `GET_PARAMETER`
 - `TEARDOWN`
 
-After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the client's UDP ping, then sends RTP packets. Video packets are sourced from an Annex B H.264 elementary stream via `SUNRISE_H264_PATH`. Audio currently sends minimal Opus silence packets. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
+After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the client's UDP ping, then sends RTP packets. Video packets are sourced from an Annex B H.264 elementary stream via `SUNRISE_H264_PATH`. The sender groups Annex B NAL units into access units and emits Moonlight-style video RTP packets with the RTP extension flag and little-endian NV video headers. Audio currently sends minimal Opus silence packets. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
 
 ## Current Limitations
 
 - Client certificate signature verification is not implemented.
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
 - RTP video is a file-backed H.264 simulator, not a live desktop stream.
+- Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
-- ENet control accepts connections and logs packets, but real GameStream control message handling and input injection are not implemented.
+- ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
 - No video capture, audio capture, NVENC, or Windows screen capture exists yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
