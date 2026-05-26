@@ -77,6 +77,29 @@ mac_address = "$mac"
 "@ | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
+function New-SmokeH264Source {
+    param([string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        return
+    }
+
+    $ffmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($null -eq $ffmpeg) {
+        throw "ffmpeg.exe is required to generate the smoke H.264 source"
+    }
+
+    & $ffmpeg.Source -hide_banner -loglevel error -y `
+        -f lavfi -i "testsrc2=size=640x360:rate=30" `
+        -t 2 `
+        -c:v libx264 -preset ultrafast -tune zerolatency `
+        -an -f h264 $Path
+
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $Path)) {
+        throw "ffmpeg failed to generate $Path"
+    }
+}
+
 function Invoke-MoonlightPairUntilPaired {
     param(
         [string]$LogPath,
@@ -232,12 +255,62 @@ function Invoke-LaunchAndRtspSmoke {
         if ($describeResponse -notmatch "a=rtpmap:96 H264/90000" -or $describeResponse -notmatch "a=rtpmap:97 opus/48000/2") {
             throw "Unexpected RTSP DESCRIBE response: $describeResponse"
         }
+
+        $setupVideo = [System.Text.Encoding]::ASCII.GetBytes("SETUP streamid=video RTSP/1.0`r`nCSeq: 3`r`nTransport: unicast;client_port=55000-55001`r`n`r`n")
+        $stream.Write($setupVideo, 0, $setupVideo.Length)
+        $setupVideoResponse = Read-RtspResponse -Stream $stream
+        if ($setupVideoResponse -notmatch "server_port=47998-47999") {
+            throw "Unexpected RTSP video SETUP response: $setupVideoResponse"
+        }
+
+        $setupAudio = [System.Text.Encoding]::ASCII.GetBytes("SETUP streamid=audio RTSP/1.0`r`nCSeq: 4`r`nTransport: unicast;client_port=55002-55003`r`n`r`n")
+        $stream.Write($setupAudio, 0, $setupAudio.Length)
+        $setupAudioResponse = Read-RtspResponse -Stream $stream
+        if ($setupAudioResponse -notmatch "server_port=48000-48001") {
+            throw "Unexpected RTSP audio SETUP response: $setupAudioResponse"
+        }
+
+        $play = [System.Text.Encoding]::ASCII.GetBytes("PLAY rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 5`r`nSession: DEADBEEFCAFE`r`n`r`n")
+        $stream.Write($play, 0, $play.Length)
+        $playResponse = Read-RtspResponse -Stream $stream
+        if ($playResponse -notmatch "RTSP/1.0 200 OK") {
+            throw "Unexpected RTSP PLAY response: $playResponse"
+        }
+
+        Test-RtpPacket -Port 47998 -Name "video" -MinimumLength 36
+        Test-RtpPacket -Port 48000 -Name "audio" -MinimumLength 15
     }
     finally {
         $client.Close()
     }
 
     Write-Host "Launch and RTSP smoke passed."
+}
+
+function Test-RtpPacket {
+    param(
+        [int]$Port,
+        [string]$Name,
+        [int]$MinimumLength
+    )
+
+    $udp = [System.Net.Sockets.UdpClient]::new(0)
+    $udp.Client.ReceiveTimeout = 5000
+    try {
+        $payload = [System.Text.Encoding]::ASCII.GetBytes("PING")
+        $udp.Send($payload, $payload.Length, $HostAddress, $Port) | Out-Null
+        $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $packet = $udp.Receive([ref]$remote)
+        if ($packet.Length -lt $MinimumLength) {
+            throw "Received short $Name RTP packet: $($packet.Length) bytes"
+        }
+        if ($packet[0] -ne 0x80) {
+            throw "Received invalid $Name RTP packet header: 0x$($packet[0].ToString('X2'))"
+        }
+    }
+    finally {
+        $udp.Close()
+    }
 }
 
 if (!(Test-Path -LiteralPath $MoonlightPath)) {
@@ -250,10 +323,12 @@ $logDir = Join-Path $repoRoot "target\moonlight-smoke"
 $daemonLog = Join-Path $logDir "sunrise-daemon.log"
 $pairLog = Join-Path $logDir "moonlight-pair.log"
 $listLog = Join-Path $logDir "moonlight-list.log"
+$h264Source = Join-Path $logDir "testsrc.h264"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 Remove-Item -LiteralPath $daemonLog, $pairLog, $listLog -ErrorAction SilentlyContinue
 New-SmokeConfig -Path $ConfigPath
+New-SmokeH264Source -Path $h264Source
 
 Push-Location $repoRoot
 try {
@@ -264,10 +339,11 @@ finally {
 }
 
 $daemonJob = Start-Job -ScriptBlock {
-    param($ExePath, $ConfigPath, $Pin, $LogPath)
+    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source)
     $env:SUNRISE_PAIRING_PIN = $Pin
+    $env:SUNRISE_H264_PATH = $H264Source
     & $ExePath --config $ConfigPath *>&1 | Tee-Object -FilePath $LogPath
-} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog
+} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source
 
 try {
     Wait-Port -HostName "127.0.0.1" -Port 47989

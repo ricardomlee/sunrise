@@ -58,9 +58,16 @@ On Windows with Moonlight installed:
 .\scripts\moonlight-smoke.ps1
 ```
 
-The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned. It also probes `/launch` and sends persistent RTSP `OPTIONS` and `DESCRIBE` requests over one TCP connection.
+The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned. It also probes `/launch`, sends persistent RTSP `OPTIONS`, `DESCRIBE`, `SETUP`, and `PLAY` requests over one TCP connection, sends UDP pings, and verifies that video/audio RTP packets are returned.
 
 The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
+
+The smoke test uses local `ffmpeg.exe` to generate `target\moonlight-smoke\testsrc.h264`. To use your own Annex B H.264 elementary stream when running the daemon manually:
+
+```powershell
+$env:SUNRISE_H264_PATH = "C:\path\to\sample.h264"
+cargo run -p sunrise-daemon
+```
 
 If your Moonlight install is in a different location:
 
@@ -93,15 +100,17 @@ sunrise now accepts HTTPS `/launch` for the fake `Desktop` app and returns a pla
 - `SETUP`
 - `ANNOUNCE`
 - `PLAY`
+- `GET_PARAMETER`
+- `TEARDOWN`
 
-This is only a handshake scaffold. It advertises placeholder H.264 video and Opus audio SDP, but it does not send RTP video/audio packets yet.
+After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the client's UDP ping, then sends RTP packets. Video packets are sourced from an Annex B H.264 elementary stream via `SUNRISE_H264_PATH`. Audio currently sends minimal Opus silence packets.
 
 ## Current Limitations
 
 - Client certificate signature verification is not implemented.
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
-- RTSP replies are placeholders for Moonlight probing and early negotiation.
-- RTP video and audio are not implemented.
+- RTP video is a file-backed H.264 simulator, not a live desktop stream.
+- RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control/input is not implemented.
 - No video capture, audio capture, NVENC, or Windows screen capture exists yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
