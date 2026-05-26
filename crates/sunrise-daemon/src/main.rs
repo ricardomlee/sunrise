@@ -35,6 +35,7 @@ pub(crate) struct AppState {
     pub(crate) local_ip: Arc<String>,
     pub(crate) pairing: PairingState,
     pub(crate) current_game: Arc<Mutex<u32>>,
+    pub(crate) rtsp: rtsp::RtspState,
 }
 
 #[tokio::main]
@@ -92,6 +93,7 @@ async fn main() -> Result<()> {
         local_ip: Arc::new(local_ip),
         pairing,
         current_game: Arc::new(Mutex::new(0)),
+        rtsp: rtsp::RtspState::default(),
     };
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));

@@ -236,55 +236,62 @@ function Invoke-LaunchAndRtspSmoke {
         throw "Launch response did not advertise the expected RTSP URL: $launchResponse"
     }
 
+    $optionsResponse = Invoke-RtspRequest -Request "OPTIONS rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 1`r`n`r`n"
+    if ($optionsResponse -notmatch "RTSP/1.0 200 OK" -or $optionsResponse -notmatch "Connection: close") {
+        throw "Unexpected RTSP OPTIONS response: $optionsResponse"
+    }
+
+    $describeResponse = Invoke-RtspRequest -Request "DESCRIBE rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 2`r`nAccept: application/sdp`r`n`r`n"
+    if ($describeResponse -notmatch "a=rtpmap:96 H264/90000" -or $describeResponse -notmatch "a=rtpmap:97 opus/48000/2") {
+        throw "Unexpected RTSP DESCRIBE response: $describeResponse"
+    }
+
+    $setupAudioResponse = Invoke-RtspRequest -Request "SETUP streamid=audio/0/0 RTSP/1.0`r`nCSeq: 3`r`nTransport: unicast;X-GS-ClientPort=50000-50001`r`n`r`n"
+    if ($setupAudioResponse -notmatch "server_port=48000-48001") {
+        throw "Unexpected RTSP audio SETUP response: $setupAudioResponse"
+    }
+
+    $setupVideoResponse = Invoke-RtspRequest -Request "SETUP streamid=video/0/0 RTSP/1.0`r`nCSeq: 4`r`nSession: DEADBEEFCAFE`r`nTransport: unicast;X-GS-ClientPort=50000-50001`r`n`r`n"
+    if ($setupVideoResponse -notmatch "server_port=47998-47999") {
+        throw "Unexpected RTSP video SETUP response: $setupVideoResponse"
+    }
+
+    $setupControlResponse = Invoke-RtspRequest -Request "SETUP streamid=control/13/0 RTSP/1.0`r`nCSeq: 5`r`nSession: DEADBEEFCAFE`r`nTransport: unicast;X-GS-ClientPort=50000-50001`r`n`r`n"
+    if ($setupControlResponse -notmatch "server_port=47999-48000") {
+        throw "Unexpected RTSP control SETUP response: $setupControlResponse"
+    }
+
+    $announceResponse = Invoke-RtspRequest -Request "ANNOUNCE streamid=control/13/0 RTSP/1.0`r`nCSeq: 6`r`nSession: DEADBEEFCAFE`r`nContent-type: application/sdp`r`nContent-length: 0`r`n`r`n"
+    if ($announceResponse -notmatch "RTSP/1.0 200 OK") {
+        throw "Unexpected RTSP ANNOUNCE response: $announceResponse"
+    }
+
+    $playResponse = Invoke-RtspRequest -Request "PLAY / RTSP/1.0`r`nCSeq: 7`r`nSession: DEADBEEFCAFE`r`n`r`n"
+    if ($playResponse -notmatch "RTSP/1.0 200 OK") {
+        throw "Unexpected RTSP PLAY response: $playResponse"
+    }
+
+    Test-RtpPacket -Port 47998 -Name "video" -MinimumLength 36
+    Test-RtpPacket -Port 48000 -Name "audio" -MinimumLength 15
+
+    Write-Host "Launch and RTSP smoke passed."
+}
+
+function Invoke-RtspRequest {
+    param([string]$Request)
+
     $client = [System.Net.Sockets.TcpClient]::new($HostAddress, 48010)
     $client.ReceiveTimeout = 5000
     $client.SendTimeout = 5000
     try {
         $stream = $client.GetStream()
-
-        $options = [System.Text.Encoding]::ASCII.GetBytes("OPTIONS rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 1`r`n`r`n")
-        $stream.Write($options, 0, $options.Length)
-        $optionsResponse = Read-RtspResponse -Stream $stream
-        if ($optionsResponse -notmatch "RTSP/1.0 200 OK" -or $optionsResponse -notmatch "Connection: keep-alive") {
-            throw "Unexpected RTSP OPTIONS response: $optionsResponse"
-        }
-
-        $describe = [System.Text.Encoding]::ASCII.GetBytes("DESCRIBE rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 2`r`nAccept: application/sdp`r`n`r`n")
-        $stream.Write($describe, 0, $describe.Length)
-        $describeResponse = Read-RtspResponse -Stream $stream
-        if ($describeResponse -notmatch "a=rtpmap:96 H264/90000" -or $describeResponse -notmatch "a=rtpmap:97 opus/48000/2") {
-            throw "Unexpected RTSP DESCRIBE response: $describeResponse"
-        }
-
-        $setupVideo = [System.Text.Encoding]::ASCII.GetBytes("SETUP streamid=video RTSP/1.0`r`nCSeq: 3`r`nTransport: unicast;client_port=55000-55001`r`n`r`n")
-        $stream.Write($setupVideo, 0, $setupVideo.Length)
-        $setupVideoResponse = Read-RtspResponse -Stream $stream
-        if ($setupVideoResponse -notmatch "server_port=47998-47999") {
-            throw "Unexpected RTSP video SETUP response: $setupVideoResponse"
-        }
-
-        $setupAudio = [System.Text.Encoding]::ASCII.GetBytes("SETUP streamid=audio RTSP/1.0`r`nCSeq: 4`r`nTransport: unicast;client_port=55002-55003`r`n`r`n")
-        $stream.Write($setupAudio, 0, $setupAudio.Length)
-        $setupAudioResponse = Read-RtspResponse -Stream $stream
-        if ($setupAudioResponse -notmatch "server_port=48000-48001") {
-            throw "Unexpected RTSP audio SETUP response: $setupAudioResponse"
-        }
-
-        $play = [System.Text.Encoding]::ASCII.GetBytes("PLAY rtsp://$HostAddress`:48010 RTSP/1.0`r`nCSeq: 5`r`nSession: DEADBEEFCAFE`r`n`r`n")
-        $stream.Write($play, 0, $play.Length)
-        $playResponse = Read-RtspResponse -Stream $stream
-        if ($playResponse -notmatch "RTSP/1.0 200 OK") {
-            throw "Unexpected RTSP PLAY response: $playResponse"
-        }
-
-        Test-RtpPacket -Port 47998 -Name "video" -MinimumLength 36
-        Test-RtpPacket -Port 48000 -Name "audio" -MinimumLength 15
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($Request)
+        $stream.Write($bytes, 0, $bytes.Length)
+        Read-RtspResponse -Stream $stream
     }
     finally {
         $client.Close()
     }
-
-    Write-Host "Launch and RTSP smoke passed."
 }
 
 function Test-RtpPacket {

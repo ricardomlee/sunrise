@@ -1,6 +1,7 @@
 use std::{collections::HashMap, env, fs, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -23,6 +24,11 @@ const RTP_AUDIO_HEADER_LEN: usize = 12;
 const STREAM_PACKET_PAYLOAD_SIZE: usize = 1024;
 const VIDEO_MAGIC: &[u8; 8] = b"\x017charss";
 
+#[derive(Clone, Default)]
+pub struct RtspState {
+    inner: Arc<Mutex<RtspSessionState>>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct RtspRequest {
     method: String,
@@ -36,10 +42,10 @@ impl RtspRequest {
         self.headers.get("cseq").map(String::as_str).unwrap_or("1")
     }
 
-    fn should_close(&self) -> bool {
+    fn requested_keep_alive(&self) -> bool {
         self.headers
             .get("connection")
-            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("keep-alive"))
     }
 }
 
@@ -72,7 +78,6 @@ async fn handle_rtsp_connection(
     } else {
         state.local_ip.to_string()
     };
-    let mut session = RtspConnectionState::default();
     let mut buffer = Vec::new();
 
     while let Some(request) = read_rtsp_request(&mut stream, &mut buffer).await? {
@@ -85,15 +90,15 @@ async fn handle_rtsp_connection(
             "incoming RTSP request"
         );
 
-        let should_close = request.should_close() || request.method == "TEARDOWN";
+        let should_close = !request.requested_keep_alive() || request.method == "TEARDOWN";
         if request.method == "SETUP" {
             if let Some(media) = media_kind_for_target(&request.target) {
-                session.setup_udp(media).await?;
+                state.rtsp.setup_udp(media).await?;
             }
         } else if request.method == "PLAY" {
-            session.start_streams().await;
+            state.rtsp.start_streams().await;
         } else if request.method == "TEARDOWN" {
-            session.stop_streams();
+            state.rtsp.stop_streams().await;
         }
 
         let response = rtsp_response(&request, &source_ip, should_close);
@@ -108,50 +113,56 @@ async fn handle_rtsp_connection(
     }
 
     stream.shutdown().await.ok();
-    session.stop_streams();
     Ok(())
 }
 
 #[derive(Default)]
-struct RtspConnectionState {
+struct RtspSessionState {
     video_socket: Option<Arc<UdpSocket>>,
     audio_socket: Option<Arc<UdpSocket>>,
+    control_socket: Option<Arc<UdpSocket>>,
     stream_tasks: Vec<JoinHandle<()>>,
     streams_started: bool,
 }
 
-impl RtspConnectionState {
-    async fn setup_udp(&mut self, media: MediaKind) -> Result<()> {
+impl RtspState {
+    async fn setup_udp(&self, media: MediaKind) -> Result<()> {
+        let mut session = self.inner.lock().await;
         match media {
-            MediaKind::Video if self.video_socket.is_none() => {
-                self.video_socket = Some(Arc::new(bind_udp_port(VIDEO_PORT).await?));
+            MediaKind::Video if session.video_socket.is_none() => {
+                session.video_socket = Some(Arc::new(bind_udp_port(VIDEO_PORT).await?));
                 info!(port = VIDEO_PORT, "video RTP UDP port ready");
             }
-            MediaKind::Audio if self.audio_socket.is_none() => {
-                self.audio_socket = Some(Arc::new(bind_udp_port(AUDIO_PORT).await?));
+            MediaKind::Audio if session.audio_socket.is_none() => {
+                session.audio_socket = Some(Arc::new(bind_udp_port(AUDIO_PORT).await?));
                 info!(port = AUDIO_PORT, "audio RTP UDP port ready");
+            }
+            MediaKind::Control if session.control_socket.is_none() => {
+                session.control_socket = Some(Arc::new(bind_udp_port(CONTROL_PORT).await?));
+                info!(port = CONTROL_PORT, "control UDP port ready");
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn start_streams(&mut self) {
-        if self.streams_started {
+    async fn start_streams(&self) {
+        let mut session = self.inner.lock().await;
+        if session.streams_started {
             return;
         }
-        self.streams_started = true;
+        session.streams_started = true;
 
-        if let Some(socket) = self.video_socket.clone() {
-            self.stream_tasks.push(tokio::spawn(async move {
+        if let Some(socket) = session.video_socket.clone() {
+            session.stream_tasks.push(tokio::spawn(async move {
                 if let Err(err) = stream_video_rtp(socket).await {
                     warn!(error = %err, "video RTP sender stopped");
                 }
             }));
         }
 
-        if let Some(socket) = self.audio_socket.clone() {
-            self.stream_tasks.push(tokio::spawn(async move {
+        if let Some(socket) = session.audio_socket.clone() {
+            session.stream_tasks.push(tokio::spawn(async move {
                 if let Err(err) = stream_audio_rtp(socket).await {
                     warn!(error = %err, "audio RTP sender stopped");
                 }
@@ -159,11 +170,15 @@ impl RtspConnectionState {
         }
     }
 
-    fn stop_streams(&mut self) {
-        for task in self.stream_tasks.drain(..) {
+    async fn stop_streams(&self) {
+        let mut session = self.inner.lock().await;
+        for task in session.stream_tasks.drain(..) {
             task.abort();
         }
-        self.streams_started = false;
+        session.streams_started = false;
+        session.video_socket = None;
+        session.audio_socket = None;
+        session.control_socket = None;
     }
 }
 
@@ -379,7 +394,7 @@ async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
     let mut ticker = interval(Duration::from_millis(33));
 
     info!(%client, frames = frames.len(), "starting synthetic video RTP sender");
-    for frame in frames.iter().cycle().take(300) {
+    for frame in frames.iter().cycle() {
         ticker.tick().await;
         let packets = build_video_rtp_packets(
             frame,
@@ -408,7 +423,7 @@ async fn stream_audio_rtp(socket: Arc<UdpSocket>) -> Result<()> {
     let mut ticker = interval(Duration::from_millis(20));
 
     info!(%client, "starting synthetic audio RTP sender");
-    for _ in 0..500 {
+    loop {
         ticker.tick().await;
         let packet = build_audio_rtp_packet(sequence, timestamp, &silence_opus_packet);
         socket
@@ -418,8 +433,6 @@ async fn stream_audio_rtp(socket: Arc<UdpSocket>) -> Result<()> {
         sequence = sequence.wrapping_add(1);
         timestamp = timestamp.wrapping_add(960);
     }
-
-    Ok(())
 }
 
 async fn wait_for_udp_ping(socket: &UdpSocket, media: &str) -> Result<SocketAddr> {
@@ -708,14 +721,14 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_is_default_for_rtsp_responses() {
+    fn close_is_default_for_moonlight_tcp_rtsp_responses() {
         let request =
             parse_rtsp_request(b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n")
                 .unwrap();
 
-        let response = rtsp_response(&request, "127.0.0.1", false);
+        let response = rtsp_response(&request, "127.0.0.1", true);
 
-        assert!(response.contains("Connection: keep-alive\r\n"));
+        assert!(response.contains("Connection: close\r\n"));
     }
 
     #[test]

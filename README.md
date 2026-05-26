@@ -58,7 +58,7 @@ On Windows with Moonlight installed:
 .\scripts\moonlight-smoke.ps1
 ```
 
-The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned. It also probes `/launch`, sends persistent RTSP `OPTIONS`, `DESCRIBE`, `SETUP`, and `PLAY` requests over one TCP connection, sends UDP pings, and verifies that video/audio RTP packets are returned.
+The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned. It also probes `/launch`, sends RTSP `OPTIONS`, `DESCRIBE`, `SETUP`, and `PLAY` requests using Moonlight-compatible close-after-response TCP transactions, sends UDP pings, and verifies that video/audio RTP packets are returned.
 
 The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
 
