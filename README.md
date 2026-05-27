@@ -101,6 +101,21 @@ If the desktop is exposed as HDR/scRGB (`Rgba16F`) or 10-bit RGB, sunrise perfor
 
 DXGI Desktop Duplication only produces a new frame when the desktop changes. During the native NVENC smoke test, sunrise keeps a persistent GPU input texture and reuses the last captured frame when `AcquireNextFrame` times out, so a static desktop can still produce the requested number of encoded frames.
 
+To make RTSP/RTP use live capture and native NVENC instead of `SUNRISE_H264_PATH`, run the daemon with the native feature and opt in explicitly:
+
+```powershell
+$env:SUNRISE_VIDEO_SOURCE = "native-nvenc"
+cargo run -p sunrise-daemon --features native-nvenc
+```
+
+Optional knobs:
+
+```powershell
+$env:SUNRISE_VIDEO_FPS = "30"
+$env:SUNRISE_CAPTURE_MONITOR = "1"
+$env:SUNRISE_CAPTURE_TIMEOUT_MS = "33"
+```
+
 If your Moonlight install is in a different location:
 
 ```powershell
@@ -151,7 +166,7 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 - Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - Windows capture has a DXGI frame source plus smoke/loop tests.
 - H.264 encode smoke can produce Annex B output from captured frames through ffmpeg.
-- Native D3D11 NVENC smoke can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames, but live encoded capture is not connected to the RTSP media pipeline yet.
+- Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. RTSP/RTP can opt into this live source with `SUNRISE_VIDEO_SOURCE=native-nvenc`, but it still needs testing on an NVIDIA host.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
 - No live video capture-to-RTSP loop or audio capture implementation exists yet.

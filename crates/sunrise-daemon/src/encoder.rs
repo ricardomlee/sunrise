@@ -3,6 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::Result;
 
 use crate::capture::CaptureSourceOptions;
+use crate::media::VideoSource;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EncodeSmokeOptions {
@@ -75,6 +76,11 @@ pub(crate) fn run_native_nvenc_smoke(
     native_nvenc_impl::run_native_nvenc_smoke(options)
 }
 
+#[cfg(all(target_os = "windows", feature = "native-nvenc"))]
+pub(crate) fn native_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    native_nvenc_impl::native_nvenc_video_source_from_env()
+}
+
 #[cfg(not(all(target_os = "windows", feature = "native-nvenc")))]
 pub(crate) fn run_native_nvenc_smoke(
     options: NativeNvencSmokeOptions,
@@ -88,6 +94,13 @@ pub(crate) fn run_native_nvenc_smoke(
     );
     anyhow::bail!(
         "native-nvenc-smoke requires Windows and the native-nvenc feature; run: cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke"
+    )
+}
+
+#[cfg(not(all(target_os = "windows", feature = "native-nvenc")))]
+pub(crate) fn native_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    anyhow::bail!(
+        "native NVENC video source requires Windows and the native-nvenc feature; run: cargo run -p sunrise-daemon --features native-nvenc"
     )
 }
 
@@ -362,7 +375,12 @@ mod ffmpeg_impl {
 
 #[cfg(all(target_os = "windows", feature = "native-nvenc"))]
 mod native_nvenc_impl {
-    use std::{fs, io::Write, panic::AssertUnwindSafe, time::Instant};
+    use std::{
+        fs,
+        io::Write,
+        panic::AssertUnwindSafe,
+        time::{Duration, Instant},
+    };
 
     use anyhow::{Context, Result, anyhow, bail};
     use nvenc::{
@@ -405,7 +423,36 @@ mod native_nvenc_impl {
         monitor::Monitor,
     };
 
+    use crate::{
+        capture::CaptureSourceOptions,
+        media::{EncodedVideoFrame, VideoSource},
+    };
+
     use super::{NativeNvencSmokeOptions, NativeNvencSmokeReport, h264_nal_unit_count};
+
+    pub(crate) fn native_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+        let fps = std::env::var("SUNRISE_VIDEO_FPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let monitor_index = std::env::var("SUNRISE_CAPTURE_MONITOR")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let timeout_ms = std::env::var("SUNRISE_CAPTURE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(33)
+            .max(1);
+
+        Ok(Box::new(NativeNvencVideoSource::new(
+            CaptureSourceOptions {
+                monitor_index,
+                timeout_ms,
+            },
+            fps,
+        )?))
+    }
 
     pub(crate) fn run_native_nvenc_smoke(
         options: NativeNvencSmokeOptions,
@@ -572,6 +619,146 @@ mod native_nvenc_impl {
             &mut self,
         ) -> std::result::Result<DxgiDuplicationFrame<'_>, DxgiDuplicationError> {
             self.duplication.acquire_next_frame(self.timeout_ms)
+        }
+    }
+
+    struct NativeNvencVideoSource {
+        source: DxgiTextureSource,
+        input_stage: NvencInputStage,
+        encoder: Encoder,
+        bitstreams: BitstreamPool,
+        description: String,
+        width: u32,
+        height: u32,
+        frame_interval: Duration,
+        timestamp_step: u32,
+        frame_index: u32,
+        encode_index: usize,
+        reused_frames: u64,
+    }
+
+    // The NVENC session, D3D11 resources, and bitstream pool are owned by one video source and are
+    // accessed only through `&mut self` on the RTP sender task. This marker lets Tokio move that
+    // task between worker threads without permitting concurrent access to the encoder.
+    unsafe impl Send for NativeNvencVideoSource {}
+
+    impl NativeNvencVideoSource {
+        fn new(options: CaptureSourceOptions, fps: u32) -> Result<Self> {
+            let mut source = DxgiTextureSource::new(options.monitor_index, options.timeout_ms)?;
+            let first_frame = source.next_frame()?;
+            let width = first_frame.width();
+            let height = first_frame.height();
+            let source_dxgi_format = first_frame.format();
+            let source_format = format!("{source_dxgi_format:?}");
+            let input_stage = NvencInputStage::new(
+                first_frame.device(),
+                first_frame.device_context(),
+                width,
+                height,
+                source_dxgi_format,
+            )?;
+            input_stage.update_from_frame(&first_frame)?;
+            drop(first_frame);
+
+            let fps = fps.max(1);
+            let encoder = create_encoder(
+                input_stage.device(),
+                width,
+                height,
+                fps,
+                input_stage.nvenc_format(),
+            )?;
+            let bitstreams = BitstreamPool::new(&encoder)?;
+            let description = format!(
+                "native D3D11 NVENC live capture {width}x{height} {source_format} -> {}",
+                input_stage.nvenc_format_name()
+            );
+
+            info!(
+                width,
+                height,
+                fps,
+                source_format = %source_format,
+                nvenc_format = %input_stage.nvenc_format_name(),
+                "created native D3D11 NVENC live video source"
+            );
+
+            Ok(Self {
+                source,
+                input_stage,
+                encoder,
+                bitstreams,
+                description,
+                width,
+                height,
+                frame_interval: Duration::from_millis(u64::from(1000 / fps)),
+                timestamp_step: 90_000 / fps,
+                frame_index: 1,
+                encode_index: 0,
+                reused_frames: 0,
+            })
+        }
+
+        fn refresh_input_stage(&mut self) -> Result<()> {
+            match self.source.next_frame() {
+                Ok(frame) => {
+                    if frame.width() != self.width || frame.height() != self.height {
+                        bail!(
+                            "capture frame size changed from {}x{} to {}x{}",
+                            self.width,
+                            self.height,
+                            frame.width(),
+                            frame.height()
+                        );
+                    }
+                    self.input_stage.update_from_frame(&frame)?;
+                }
+                Err(err) if should_reuse_last_frame(&err) => {
+                    self.reused_frames += 1;
+                }
+                Err(err) => {
+                    return Err(err).context("failed to acquire a DXGI texture frame");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl VideoSource for NativeNvencVideoSource {
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn frame_count_hint(&self) -> Option<usize> {
+            None
+        }
+
+        fn frame_interval(&self) -> Duration {
+            self.frame_interval
+        }
+
+        fn next_frame(&mut self) -> Result<EncodedVideoFrame> {
+            if self.encode_index > 0 {
+                self.refresh_input_stage()?;
+            }
+
+            let data = encode_input_stage_to_vec(
+                &self.encoder,
+                &mut self.bitstreams,
+                &self.input_stage,
+                self.encode_index,
+            )?;
+            let frame_index = self.frame_index;
+            let timestamp_90khz = frame_index.saturating_mul(self.timestamp_step);
+
+            self.encode_index = self.encode_index.wrapping_add(1);
+            self.frame_index = self.frame_index.wrapping_add(1);
+
+            Ok(EncodedVideoFrame {
+                data,
+                frame_index,
+                timestamp_90khz,
+            })
         }
     }
 
@@ -1003,6 +1190,18 @@ mod native_nvenc_impl {
         input_stage: &NvencInputStage,
         frame_index: usize,
     ) -> Result<()> {
+        let bytes = encode_input_stage_to_vec(encoder, bitstreams, input_stage, frame_index)?;
+        out.write_all(&bytes)
+            .context("failed to write native NVENC bitstream")?;
+        Ok(())
+    }
+
+    fn encode_input_stage_to_vec(
+        encoder: &Encoder,
+        bitstreams: &mut BitstreamPool,
+        input_stage: &NvencInputStage,
+        frame_index: usize,
+    ) -> Result<Vec<u8>> {
         let registered = encoder
             .register_resource_dx11(
                 input_stage.texture(),
@@ -1029,9 +1228,9 @@ mod native_nvenc_impl {
             .map_err(nvenc_error)?;
         drop(registered);
 
-        write_bitstream(out, &bitstream)?;
+        let data = bitstream_bytes(&bitstream)?;
         bitstreams.recycle(bitstream);
-        Ok(())
+        Ok(data)
     }
 
     fn flush_encoder(
@@ -1047,10 +1246,15 @@ mod native_nvenc_impl {
     }
 
     fn write_bitstream(out: &mut fs::File, bitstream: &BitStream) -> Result<()> {
-        let lock = bitstream.try_lock(true).map_err(nvenc_error)?;
-        out.write_all(lock.as_slice())
+        let data = bitstream_bytes(bitstream)?;
+        out.write_all(&data)
             .context("failed to write native NVENC bitstream")?;
         Ok(())
+    }
+
+    fn bitstream_bytes(bitstream: &BitStream) -> Result<Vec<u8>> {
+        let lock = bitstream.try_lock(true).map_err(nvenc_error)?;
+        Ok(lock.as_slice().to_vec())
     }
 
     fn nvenc_format_for_dxgi(format: DxgiDuplicationFormat) -> Result<NVencBufferFormat> {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    AppState, control,
+    AppState, control, encoder,
     media::{AnnexBVideoSource, AudioPacketizer, OpusSilenceSource, VideoPacketizer, VideoSource},
 };
 
@@ -386,7 +386,7 @@ fn describe_sdp(source_ip: &str) -> String {
 
 async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
     let client = wait_for_udp_ping(&socket, "video").await?;
-    let mut source = AnnexBVideoSource::from_env();
+    let mut source = video_source_from_env()?;
     let mut packetizer = VideoPacketizer::new();
     let mut ticker = interval(source.frame_interval());
 
@@ -406,6 +406,22 @@ async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
                 .context("failed to send video RTP packet")?;
         }
     }
+}
+
+fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    let video_source = env::var("SUNRISE_VIDEO_SOURCE").ok();
+    let live_nvenc = env::var("SUNRISE_LIVE_NVENC").ok();
+
+    if wants_native_nvenc_video_source(video_source.as_deref(), live_nvenc.as_deref()) {
+        return encoder::native_nvenc_video_source_from_env();
+    }
+
+    Ok(Box::new(AnnexBVideoSource::from_env()))
+}
+
+fn wants_native_nvenc_video_source(video_source: Option<&str>, live_nvenc: Option<&str>) -> bool {
+    video_source.is_some_and(|value| value.eq_ignore_ascii_case("native-nvenc"))
+        || live_nvenc.is_some_and(|value| value == "1")
 }
 
 async fn stream_audio_rtp(socket: Arc<UdpSocket>) -> Result<()> {
@@ -548,5 +564,14 @@ mod tests {
         let response = rtsp_response(&request, "127.0.0.1", true);
 
         assert!(response.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn native_nvenc_video_source_is_explicitly_requested() {
+        assert!(wants_native_nvenc_video_source(Some("native-nvenc"), None));
+        assert!(wants_native_nvenc_video_source(Some("NATIVE-NVENC"), None));
+        assert!(wants_native_nvenc_video_source(None, Some("1")));
+        assert!(!wants_native_nvenc_video_source(None, None));
+        assert!(!wants_native_nvenc_video_source(Some("annex-b"), Some("0")));
     }
 }
