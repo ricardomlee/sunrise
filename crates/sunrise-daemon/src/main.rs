@@ -56,9 +56,25 @@ async fn main() -> Result<()> {
             height = report.height,
             row_pitch = report.row_pitch,
             depth_pitch = report.depth_pitch,
-            color_format = %report.color_format,
+            source_format = %report.source_format,
             bytes_written = report.bytes_written,
             "Windows capture smoke completed"
+        );
+        return Ok(());
+    }
+    if let Command::CaptureLoop(options) = command {
+        let report = capture::run_capture_loop(options)?;
+        let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
+        info!(
+            monitor_index = report.monitor_index,
+            monitor_name = report.monitor_name.as_deref().unwrap_or("unknown"),
+            width = report.width,
+            height = report.height,
+            frames = report.frames,
+            elapsed_ms = report.elapsed.as_millis(),
+            fps,
+            source_format = %report.source_format,
+            "Windows capture loop completed"
         );
         return Ok(());
     }
@@ -146,6 +162,7 @@ fn init_logging() {
 enum Command {
     Serve { config_path: PathBuf },
     CaptureSmoke(capture::CaptureSmokeOptions),
+    CaptureLoop(capture::CaptureLoopOptions),
 }
 
 fn parse_command() -> Result<Command> {
@@ -169,6 +186,10 @@ fn parse_command() -> Result<Command> {
         Some("capture-smoke") => {
             args.next();
             parse_capture_smoke(args).map(Command::CaptureSmoke)
+        }
+        Some("capture-loop") => {
+            args.next();
+            parse_capture_loop(args).map(Command::CaptureLoop)
         }
         _ => Err(anyhow!(usage())),
     }
@@ -215,13 +236,65 @@ where
 
     Ok(capture::CaptureSmokeOptions {
         output_path,
-        monitor_index,
-        timeout_ms,
+        source: capture::CaptureSourceOptions {
+            monitor_index,
+            timeout_ms,
+        },
+    })
+}
+
+fn parse_capture_loop<I>(args: I) -> Result<capture::CaptureLoopOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut frame_count = 120_u32;
+    let mut monitor_index = None;
+    let mut timeout_ms = 33_u32;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--frames" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --frames"));
+                };
+                frame_count = value
+                    .parse::<u32>()
+                    .context("failed to parse --frames as a frame count")?;
+            }
+            "--monitor" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --monitor"));
+                };
+                monitor_index = Some(
+                    value
+                        .parse::<usize>()
+                        .context("failed to parse --monitor as a one-based monitor index")?,
+                );
+            }
+            "--timeout-ms" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --timeout-ms"));
+                };
+                timeout_ms = value
+                    .parse::<u32>()
+                    .context("failed to parse --timeout-ms as milliseconds")?;
+            }
+            _ => return Err(anyhow!(usage())),
+        }
+    }
+
+    Ok(capture::CaptureLoopOptions {
+        source: capture::CaptureSourceOptions {
+            monitor_index,
+            timeout_ms,
+        },
+        frame_count,
     })
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {

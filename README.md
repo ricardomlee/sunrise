@@ -77,7 +77,13 @@ The first native Windows capture path is available behind the `capture-windows` 
 cargo run -p sunrise-daemon --features capture-windows -- capture-smoke --output target\capture-smoke\frame.bmp
 ```
 
-This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the BMP output. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. This command only validates frame acquisition; it is not yet wired into RTSP video or NVENC.
+The capture source can also run a short continuous loop and report the observed capture throughput:
+
+```powershell
+cargo run -p sunrise-daemon --features capture-windows -- capture-loop --frames 120
+```
+
+This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the current CPU-side frame boundary. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. These commands validate frame acquisition; the source is not yet wired into RTSP video or NVENC.
 
 If your Moonlight install is in a different location:
 
@@ -127,7 +133,7 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
 - RTP video is driven through the media framework, but the only implemented video source is still a file-backed H.264 simulator.
 - Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
-- Windows capture has a one-frame DXGI smoke test, but live capture is not connected to the media pipeline yet.
+- Windows capture has a DXGI frame source and smoke/loop tests, but live capture is not connected to the media pipeline yet.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
 - No live video capture loop, audio capture, or NVENC implementation exists yet.
