@@ -77,7 +77,7 @@ The first native Windows capture path is available behind the `capture-windows` 
 cargo run -p sunrise-daemon --features capture-windows -- capture-smoke --output target\capture-smoke\frame.bmp
 ```
 
-This must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. This command only validates frame acquisition; it is not yet wired into RTSP video or NVENC.
+This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the BMP output. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. This command only validates frame acquisition; it is not yet wired into RTSP video or NVENC.
 
 If your Moonlight install is in a different location:
 

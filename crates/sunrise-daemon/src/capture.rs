@@ -156,11 +156,10 @@ mod windows_capture_impl {
             | DxgiDuplicationFormat::Bgra8Srgb
             | DxgiDuplicationFormat::Rgba8
             | DxgiDuplicationFormat::Rgba8Srgb => 4,
-            DxgiDuplicationFormat::Rgb10A2
-            | DxgiDuplicationFormat::Rgb10XrA2
-            | DxgiDuplicationFormat::Rgba16F => {
+            DxgiDuplicationFormat::Rgba16F => 8,
+            DxgiDuplicationFormat::Rgb10A2 | DxgiDuplicationFormat::Rgb10XrA2 => {
                 bail!(
-                    "capture format {format:?} is not a byte BGRA/RGBA surface; HDR/10-bit conversion is a later capture milestone"
+                    "capture format {format:?} needs 10-bit conversion; this capture smoke path currently supports 8-bit and Rgba16F"
                 )
             }
         };
@@ -175,9 +174,10 @@ mod windows_capture_impl {
         let bmp_pixels = match format {
             DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => pixels.to_vec(),
             DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => rgba_to_bgra(pixels),
-            DxgiDuplicationFormat::Rgb10A2
-            | DxgiDuplicationFormat::Rgb10XrA2
-            | DxgiDuplicationFormat::Rgba16F => unreachable!("non-8-bit formats bail above"),
+            DxgiDuplicationFormat::Rgba16F => rgba16f_to_bgra8(pixels),
+            DxgiDuplicationFormat::Rgb10A2 | DxgiDuplicationFormat::Rgb10XrA2 => {
+                unreachable!("10-bit formats bail above")
+            }
         };
 
         let header_len = 14_u32 + 40_u32;
@@ -217,6 +217,68 @@ mod windows_capture_impl {
         converted
     }
 
+    fn rgba16f_to_bgra8(pixels: &[u8]) -> Vec<u8> {
+        let mut converted = Vec::with_capacity(pixels.len() / 2);
+        for pixel in pixels.chunks_exact(8) {
+            let r = f16_to_f32(u16::from_le_bytes([pixel[0], pixel[1]]));
+            let g = f16_to_f32(u16::from_le_bytes([pixel[2], pixel[3]]));
+            let b = f16_to_f32(u16::from_le_bytes([pixel[4], pixel[5]]));
+            let a = f16_to_f32(u16::from_le_bytes([pixel[6], pixel[7]]));
+            converted.push(linear_float_to_srgb8(b));
+            converted.push(linear_float_to_srgb8(g));
+            converted.push(linear_float_to_srgb8(r));
+            converted.push(float_alpha_to_u8(a));
+        }
+        converted
+    }
+
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = ((bits >> 15) & 0x1) as u32;
+        let exponent = ((bits >> 10) & 0x1f) as i32;
+        let fraction = (bits & 0x03ff) as u32;
+
+        let f32_bits = if exponent == 0 {
+            if fraction == 0 {
+                sign << 31
+            } else {
+                let mut fraction = fraction;
+                let mut exponent = -14_i32;
+                while (fraction & 0x0400) == 0 {
+                    fraction <<= 1;
+                    exponent -= 1;
+                }
+                fraction &= 0x03ff;
+                (sign << 31) | (((exponent + 127) as u32) << 23) | (fraction << 13)
+            }
+        } else if exponent == 0x1f {
+            (sign << 31) | 0x7f80_0000 | (fraction << 13)
+        } else {
+            (sign << 31) | (((exponent - 15 + 127) as u32) << 23) | (fraction << 13)
+        };
+
+        f32::from_bits(f32_bits)
+    }
+
+    fn linear_float_to_srgb8(value: f32) -> u8 {
+        if !value.is_finite() {
+            return 0;
+        }
+        let value = value.clamp(0.0, 1.0);
+        let encoded = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+
+    fn float_alpha_to_u8(value: f32) -> u8 {
+        if !value.is_finite() {
+            return 255;
+        }
+        (value.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+
     #[cfg(test)]
     mod tests {
         use std::fs;
@@ -253,6 +315,32 @@ mod windows_capture_impl {
 
             assert_eq!(&bmp[54..], &[30, 20, 10, 255]);
             Ok(())
+        }
+
+        #[test]
+        fn converts_rgba16f_bmp_pixels_to_bgra8() -> Result<()> {
+            let path = temp_bmp_path("rgba16f");
+            let pixels = [
+                0x00, 0x3c, // R = 1.0
+                0x00, 0x38, // G = 0.5
+                0x00, 0x00, // B = 0.0
+                0x00, 0x3c, // A = 1.0
+            ];
+
+            write_frame_bmp(&path, 1, 1, DxgiDuplicationFormat::Rgba16F, &pixels)?;
+            let bmp = fs::read(&path)?;
+            let _ = fs::remove_file(&path);
+
+            assert_eq!(&bmp[54..], &[0, 188, 255, 255]);
+            Ok(())
+        }
+
+        #[test]
+        fn converts_half_float_bits_to_f32() {
+            assert_eq!(f16_to_f32(0x0000), 0.0);
+            assert_eq!(f16_to_f32(0x3c00), 1.0);
+            assert_eq!(f16_to_f32(0x3800), 0.5);
+            assert_eq!(f16_to_f32(0xc000), -2.0);
         }
 
         fn temp_bmp_path(name: &str) -> std::path::PathBuf {
