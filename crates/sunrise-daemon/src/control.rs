@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, UdpSocket as StdUdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket},
     time::Duration,
 };
 
@@ -13,8 +13,8 @@ const CONTROL_PEERS: usize = 8;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 type ControlHost = Host<StdUdpSocket>;
-pub(crate) fn spawn_control_server(port: u16) -> Result<JoinHandle<()>> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+pub(crate) fn spawn_control_server(bind_ip: IpAddr, port: u16) -> Result<JoinHandle<()>> {
+    let addr = SocketAddr::new(bind_ip, port);
     let host = control_host(addr)?;
 
     Ok(tokio::spawn(async move {

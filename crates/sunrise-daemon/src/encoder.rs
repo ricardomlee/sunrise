@@ -394,7 +394,7 @@ mod native_nvenc_impl {
             guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
         },
     };
-    use tracing::info;
+    use tracing::{info, warn};
     use windows::{
         Win32::Graphics::{
             Direct3D::{
@@ -592,25 +592,19 @@ mod native_nvenc_impl {
 
     impl DxgiTextureSource {
         fn new(monitor_index: Option<usize>, timeout_ms: u32) -> Result<Self> {
-            let monitor = match monitor_index {
-                Some(index) => Monitor::from_index(index)
-                    .with_context(|| format!("failed to select monitor {index}"))?,
-                None => Monitor::primary().context("failed to select primary monitor")?,
-            };
-            let monitor_index = monitor.index().unwrap_or(monitor_index.unwrap_or(1));
-            let monitor_name = monitor.name().unwrap_or_default();
-            let width = monitor.width().context("failed to query monitor width")?;
-            let height = monitor.height().context("failed to query monitor height")?;
+            let selected = create_dxgi_texture_source(monitor_index)?;
             info!(
-                monitor_index,
-                monitor_name = %monitor_name,
-                width,
-                height,
+                monitor_index = selected.info.index,
+                monitor_name = %selected.info.name,
+                device_name = %selected.info.device_name,
+                adapter = %selected.info.device_string,
+                width = selected.info.width,
+                height = selected.info.height,
+                refresh_rate = selected.info.refresh_rate,
                 "starting zero-copy DXGI texture source"
             );
             Ok(Self {
-                duplication: DxgiDuplicationApi::new(monitor)
-                    .context("failed to create DXGI duplication session")?,
+                duplication: selected.duplication,
                 timeout_ms: timeout_ms.max(1),
             })
         }
@@ -619,6 +613,105 @@ mod native_nvenc_impl {
             &mut self,
         ) -> std::result::Result<DxgiDuplicationFrame<'_>, DxgiDuplicationError> {
             self.duplication.acquire_next_frame(self.timeout_ms)
+        }
+    }
+
+    struct SelectedDxgiTextureSource {
+        duplication: DxgiDuplicationApi,
+        info: MonitorInfo,
+    }
+
+    #[derive(Clone, Debug)]
+    struct MonitorInfo {
+        index: usize,
+        name: String,
+        device_name: String,
+        device_string: String,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+    }
+
+    fn create_dxgi_texture_source(
+        monitor_index: Option<usize>,
+    ) -> Result<SelectedDxgiTextureSource> {
+        let candidates = candidate_monitors(monitor_index)?;
+        let mut failures = Vec::new();
+
+        for monitor in candidates {
+            let info = monitor_info(monitor);
+            info!(
+                monitor_index = info.index,
+                monitor_name = %info.name,
+                device_name = %info.device_name,
+                adapter = %info.device_string,
+                width = info.width,
+                height = info.height,
+                refresh_rate = info.refresh_rate,
+                "probing zero-copy DXGI texture monitor"
+            );
+            match DxgiDuplicationApi::new(monitor) {
+                Ok(duplication) => return Ok(SelectedDxgiTextureSource { duplication, info }),
+                Err(err) => {
+                    warn!(
+                        monitor_index = info.index,
+                        monitor_name = %info.name,
+                        device_name = %info.device_name,
+                        adapter = %info.device_string,
+                        error = %err,
+                        "DXGI duplication rejected monitor"
+                    );
+                    failures.push(format!(
+                        "#{} {} {}: {err}",
+                        info.index, info.device_name, info.device_string
+                    ));
+                }
+            }
+        }
+
+        bail!(
+            "failed to create DXGI duplication session for active monitors: {}",
+            failures.join("; ")
+        )
+    }
+
+    fn candidate_monitors(monitor_index: Option<usize>) -> Result<Vec<Monitor>> {
+        if let Some(index) = monitor_index {
+            return Ok(vec![
+                Monitor::from_index(index)
+                    .with_context(|| format!("failed to select monitor {index}"))?,
+            ]);
+        }
+
+        let mut monitors = Vec::new();
+        if let Ok(primary) = Monitor::primary() {
+            monitors.push(primary);
+        }
+        for monitor in Monitor::enumerate().context("failed to enumerate active monitors")? {
+            if !monitors.contains(&monitor) {
+                monitors.push(monitor);
+            }
+        }
+
+        if monitors.is_empty() {
+            bail!("no active Windows monitors found");
+        }
+        Ok(monitors)
+    }
+
+    fn monitor_info(monitor: Monitor) -> MonitorInfo {
+        MonitorInfo {
+            index: monitor.index().unwrap_or(0),
+            name: monitor.name().unwrap_or_else(|_| "unknown".to_string()),
+            device_name: monitor
+                .device_name()
+                .unwrap_or_else(|_| "unknown".to_string()),
+            device_string: monitor
+                .device_string()
+                .unwrap_or_else(|_| "unknown".to_string()),
+            width: monitor.width().unwrap_or(0),
+            height: monitor.height().unwrap_or(0),
+            refresh_rate: monitor.refresh_rate().unwrap_or(0),
         }
     }
 

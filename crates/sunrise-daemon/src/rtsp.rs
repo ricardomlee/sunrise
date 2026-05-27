@@ -1,4 +1,10 @@
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
@@ -21,9 +27,25 @@ const VIDEO_PORT: u16 = 47998;
 const AUDIO_PORT: u16 = 48000;
 const CONTROL_PORT: u16 = 47999;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RtspState {
     inner: Arc<Mutex<RtspSessionState>>,
+    bind_ip: IpAddr,
+}
+
+impl RtspState {
+    pub fn new(bind_ip: IpAddr) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RtspSessionState::default())),
+            bind_ip,
+        }
+    }
+}
+
+impl Default for RtspState {
+    fn default() -> Self {
+        Self::new(IpAddr::from([0, 0, 0, 0]))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,15 +149,18 @@ impl RtspState {
         let mut session = self.inner.lock().await;
         match media {
             MediaKind::Video if session.video_socket.is_none() => {
-                session.video_socket = Some(Arc::new(bind_udp_port(VIDEO_PORT).await?));
+                session.video_socket =
+                    Some(Arc::new(bind_udp_port(self.bind_ip, VIDEO_PORT).await?));
                 info!(port = VIDEO_PORT, "video RTP UDP port ready");
             }
             MediaKind::Audio if session.audio_socket.is_none() => {
-                session.audio_socket = Some(Arc::new(bind_udp_port(AUDIO_PORT).await?));
+                session.audio_socket =
+                    Some(Arc::new(bind_udp_port(self.bind_ip, AUDIO_PORT).await?));
                 info!(port = AUDIO_PORT, "audio RTP UDP port ready");
             }
             MediaKind::Control if session.control_task.is_none() => {
-                session.control_task = Some(control::spawn_control_server(CONTROL_PORT)?);
+                session.control_task =
+                    Some(control::spawn_control_server(self.bind_ip, CONTROL_PORT)?);
                 info!(port = CONTROL_PORT, "ENet control UDP port ready");
             }
             _ => {}
@@ -188,10 +213,11 @@ enum MediaKind {
     Control,
 }
 
-async fn bind_udp_port(port: u16) -> Result<UdpSocket> {
-    UdpSocket::bind(("0.0.0.0", port))
+async fn bind_udp_port(bind_ip: IpAddr, port: u16) -> Result<UdpSocket> {
+    let addr = SocketAddr::new(bind_ip, port);
+    UdpSocket::bind(addr)
         .await
-        .with_context(|| format!("failed to bind UDP port {port}"))
+        .with_context(|| format!("failed to bind UDP port {addr}"))
 }
 
 async fn read_rtsp_request(

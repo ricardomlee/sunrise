@@ -28,6 +28,18 @@ The daemon listens on:
 - HTTPS: `0.0.0.0:47984`
 - RTSP: `0.0.0.0:48010`
 
+If Windows reports `os error 10048` on one of the GameStream ports but `netstat` and
+`Get-NetTCPConnection` do not show an owner, bind sunrise to the LAN address that
+Moonlight will connect to:
+
+```powershell
+$env:SUNRISE_BIND_IP = "192.168.2.123"
+cargo run -p sunrise-daemon --features native-nvenc
+```
+
+This keeps the standard Moonlight ports while avoiding wildcard `0.0.0.0` bind
+conflicts from hidden reservations or stale listeners.
+
 ## Test Locally
 
 Open:
@@ -74,6 +86,12 @@ cargo run -p sunrise-daemon
 The first native Windows capture path is available behind the `capture-windows` feature. It uses `windows-capture` with DXGI Desktop Duplication to grab one monitor frame and writes a 32-bit BGRA BMP:
 
 ```powershell
+cargo run -p sunrise-daemon --features capture-windows -- capture-list
+```
+
+`capture-list` prints each active monitor, its Windows display device, adapter string, resolution, refresh rate, and whether a DXGI duplication session can be created. This is useful on headless machines with virtual displays such as Parsec VDD. When no monitor is specified, sunrise probes the primary monitor first and then the remaining active monitors until one accepts DXGI duplication.
+
+```powershell
 cargo run -p sunrise-daemon --features capture-windows -- capture-smoke --output target\capture-smoke\frame.bmp
 ```
 
@@ -115,6 +133,8 @@ $env:SUNRISE_VIDEO_FPS = "30"
 $env:SUNRISE_CAPTURE_MONITOR = "1"
 $env:SUNRISE_CAPTURE_TIMEOUT_MS = "33"
 ```
+
+On headless systems, run `capture-list` first. If the Parsec VDD output is not the primary monitor, set `SUNRISE_CAPTURE_MONITOR` to that one-based monitor index. If the VDD is exposed through a non-NVIDIA adapter, DXGI capture may still work but zero-copy NVENC may need a later cross-adapter copy path.
 
 If your Moonlight install is in a different location:
 

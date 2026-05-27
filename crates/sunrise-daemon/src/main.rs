@@ -9,7 +9,7 @@ mod tls;
 
 use std::{
     collections::HashMap,
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::PathBuf,
     sync::Arc,
 };
@@ -79,6 +79,10 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Command::CaptureList = command {
+        capture::run_capture_list()?;
+        return Ok(());
+    }
     if let Command::EncodeSmoke(options) = command {
         let report = encoder::run_encode_smoke(options)?;
         let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
@@ -144,10 +148,12 @@ async fn main() -> Result<()> {
         info!("loaded persisted RSA-2048 certificate for pairing and HTTPS");
     }
 
-    let local_ip = detect_local_ip();
+    let bind_ip = bind_ip_from_env()?;
+    let local_ip = advertised_local_ip(bind_ip);
     let http_port = config.http_port;
     let https_port = config.https_port;
     let rtsp_port = config.rtsp_port;
+    info!(%bind_ip, local_ip = %local_ip, "using listener bind address");
     let paired_clients = config
         .paired_clients
         .iter()
@@ -167,12 +173,12 @@ async fn main() -> Result<()> {
         local_ip: Arc::new(local_ip),
         pairing,
         current_game: Arc::new(Mutex::new(0)),
-        rtsp: rtsp::RtspState::default(),
+        rtsp: rtsp::RtspState::new(bind_ip),
     };
 
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
-    let https_addr = SocketAddr::from(([0, 0, 0, 0], https_port));
-    let rtsp_addr = SocketAddr::from(([0, 0, 0, 0], rtsp_port));
+    let http_addr = SocketAddr::new(bind_ip, http_port);
+    let https_addr = SocketAddr::new(bind_ip, https_port);
+    let rtsp_addr = SocketAddr::new(bind_ip, rtsp_port);
 
     let http = serve_http(http_addr, state.clone());
     let https = tls::serve_https(https_addr, identity, state.clone());
@@ -195,10 +201,32 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+fn bind_ip_from_env() -> Result<IpAddr> {
+    match std::env::var("SUNRISE_BIND_IP") {
+        Ok(value) => parse_bind_ip(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_bind_ip(None),
+        Err(err) => Err(anyhow!("failed to read SUNRISE_BIND_IP: {err}")),
+    }
+}
+
+fn parse_bind_ip(value: Option<&str>) -> Result<IpAddr> {
+    let Some(value) = value else {
+        return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("SUNRISE_BIND_IP was set but empty"));
+    }
+    value
+        .parse::<IpAddr>()
+        .with_context(|| format!("failed to parse SUNRISE_BIND_IP={value:?} as an IP address"))
+}
+
 enum Command {
     Serve { config_path: PathBuf },
     CaptureSmoke(capture::CaptureSmokeOptions),
     CaptureLoop(capture::CaptureLoopOptions),
+    CaptureList,
     EncodeSmoke(encoder::EncodeSmokeOptions),
     NativeNvencSmoke(encoder::NativeNvencSmokeOptions),
 }
@@ -228,6 +256,13 @@ fn parse_command() -> Result<Command> {
         Some("capture-loop") => {
             args.next();
             parse_capture_loop(args).map(Command::CaptureLoop)
+        }
+        Some("capture-list") => {
+            args.next();
+            if args.next().is_some() {
+                return Err(anyhow!(usage()));
+            }
+            Ok(Command::CaptureList)
         }
         Some("encode-smoke") => {
             args.next();
@@ -488,7 +523,7 @@ where
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
@@ -571,4 +606,40 @@ fn detect_local_ip() -> String {
             warn!(%err, "failed to detect local IP, falling back to 127.0.0.1");
             "127.0.0.1".to_string()
         })
+}
+
+fn advertised_local_ip(bind_ip: IpAddr) -> String {
+    if bind_ip.is_unspecified() {
+        detect_local_ip()
+    } else {
+        bind_ip.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::parse_bind_ip;
+
+    #[test]
+    fn default_bind_ip_is_all_interfaces() {
+        assert_eq!(
+            parse_bind_ip(None).unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn parses_explicit_bind_ip() {
+        assert_eq!(
+            parse_bind_ip(Some("192.168.2.10")).unwrap(),
+            IpAddr::from([192, 168, 2, 10])
+        );
+    }
+
+    #[test]
+    fn rejects_empty_bind_ip() {
+        assert!(parse_bind_ip(Some(" ")).is_err());
+    }
 }
