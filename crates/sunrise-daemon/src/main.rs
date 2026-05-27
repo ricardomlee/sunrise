@@ -1,5 +1,6 @@
 mod capture;
 mod control;
+mod encoder;
 mod identity;
 mod media;
 mod pairing;
@@ -75,6 +76,24 @@ async fn main() -> Result<()> {
             fps,
             source_format = %report.source_format,
             "Windows capture loop completed"
+        );
+        return Ok(());
+    }
+    if let Command::EncodeSmoke(options) = command {
+        let report = encoder::run_encode_smoke(options)?;
+        let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
+        info!(
+            output = %report.output_path.display(),
+            encoder = %report.encoder,
+            width = report.width,
+            height = report.height,
+            frames = report.frames,
+            elapsed_ms = report.elapsed.as_millis(),
+            fps,
+            bytes_written = report.bytes_written,
+            nal_units = report.nal_units,
+            source_format = %report.source_format,
+            "H.264 encode smoke completed"
         );
         return Ok(());
     }
@@ -163,6 +182,7 @@ enum Command {
     Serve { config_path: PathBuf },
     CaptureSmoke(capture::CaptureSmokeOptions),
     CaptureLoop(capture::CaptureLoopOptions),
+    EncodeSmoke(encoder::EncodeSmokeOptions),
 }
 
 fn parse_command() -> Result<Command> {
@@ -190,6 +210,10 @@ fn parse_command() -> Result<Command> {
         Some("capture-loop") => {
             args.next();
             parse_capture_loop(args).map(Command::CaptureLoop)
+        }
+        Some("encode-smoke") => {
+            args.next();
+            parse_encode_smoke(args).map(Command::EncodeSmoke)
         }
         _ => Err(anyhow!(usage())),
     }
@@ -293,8 +317,90 @@ where
     })
 }
 
+fn parse_encode_smoke<I>(args: I) -> Result<encoder::EncodeSmokeOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut output_path = PathBuf::from("target/capture-smoke/capture.h264");
+    let mut ffmpeg_path = PathBuf::from("ffmpeg.exe");
+    let mut encoder = "h264_nvenc".to_string();
+    let mut frame_count = 120_u32;
+    let mut fps = 30_u32;
+    let mut monitor_index = None;
+    let mut timeout_ms = 33_u32;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--output" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --output"));
+                };
+                output_path = PathBuf::from(value);
+            }
+            "--ffmpeg" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --ffmpeg"));
+                };
+                ffmpeg_path = PathBuf::from(value);
+            }
+            "--encoder" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --encoder"));
+                };
+                encoder = value;
+            }
+            "--frames" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --frames"));
+                };
+                frame_count = value
+                    .parse::<u32>()
+                    .context("failed to parse --frames as a frame count")?;
+            }
+            "--fps" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --fps"));
+                };
+                fps = value.parse::<u32>().context("failed to parse --fps")?;
+            }
+            "--monitor" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --monitor"));
+                };
+                monitor_index = Some(
+                    value
+                        .parse::<usize>()
+                        .context("failed to parse --monitor as a one-based monitor index")?,
+                );
+            }
+            "--timeout-ms" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --timeout-ms"));
+                };
+                timeout_ms = value
+                    .parse::<u32>()
+                    .context("failed to parse --timeout-ms as milliseconds")?;
+            }
+            _ => return Err(anyhow!(usage())),
+        }
+    }
+
+    Ok(encoder::EncodeSmokeOptions {
+        source: capture::CaptureSourceOptions {
+            monitor_index,
+            timeout_ms,
+        },
+        output_path,
+        ffmpeg_path,
+        encoder,
+        frame_count,
+        fps,
+    })
+}
+
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder h264_nvenc] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
