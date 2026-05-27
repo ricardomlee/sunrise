@@ -91,6 +91,14 @@ cargo run -p sunrise-daemon --features capture-windows -- encode-smoke --frames 
 
 This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the current CPU-side frame boundary. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. These commands validate frame acquisition and H.264 encoding; the live encoder is not yet wired into RTSP video.
 
+For the native no-ffmpeg path, `native-nvenc-smoke` captures a DXGI D3D11 texture and registers a D3D11 texture directly with NVENC:
+
+```powershell
+cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke --frames 120 --fps 30 --output target\capture-smoke\native-nvenc.h264
+```
+
+If the desktop is exposed as HDR/scRGB (`Rgba16F`) or 10-bit RGB, sunrise performs a GPU render pass into a BGRA8 D3D11 texture before NVENC registration. This keeps the native path on the GPU side; it does not pipe raw frames through ffmpeg or a CPU raw-video boundary. This command requires an NVIDIA driver that exposes `nvEncodeAPI64.dll`.
+
 If your Moonlight install is in a different location:
 
 ```powershell
@@ -140,10 +148,11 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 - RTP video is driven through the media framework, but the only implemented video source is still a file-backed H.264 simulator.
 - Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - Windows capture has a DXGI frame source plus smoke/loop tests.
-- H.264 encode smoke can produce Annex B output from captured frames through ffmpeg, but live encoded capture is not connected to the RTSP media pipeline yet.
+- H.264 encode smoke can produce Annex B output from captured frames through ffmpeg.
+- Native D3D11 NVENC smoke can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames, but live encoded capture is not connected to the RTSP media pipeline yet.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
-- No live video capture loop, audio capture, or NVENC implementation exists yet.
+- No live video capture-to-RTSP loop or audio capture implementation exists yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
 ## Next Milestones

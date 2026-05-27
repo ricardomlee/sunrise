@@ -27,6 +27,26 @@ pub(crate) struct EncodeSmokeReport {
     pub(crate) source_format: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NativeNvencSmokeOptions {
+    pub(crate) source: CaptureSourceOptions,
+    pub(crate) output_path: PathBuf,
+    pub(crate) frame_count: u32,
+    pub(crate) fps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeNvencSmokeReport {
+    pub(crate) output_path: PathBuf,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) frames: u32,
+    pub(crate) elapsed: Duration,
+    pub(crate) bytes_written: u64,
+    pub(crate) nal_units: usize,
+    pub(crate) source_format: String,
+}
+
 #[cfg(all(target_os = "windows", feature = "capture-windows"))]
 pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmokeReport> {
     ffmpeg_impl::run_encode_smoke(options)
@@ -45,6 +65,29 @@ pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmok
     );
     anyhow::bail!(
         "encode-smoke requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows -- encode-smoke"
+    )
+}
+
+#[cfg(all(target_os = "windows", feature = "native-nvenc"))]
+pub(crate) fn run_native_nvenc_smoke(
+    options: NativeNvencSmokeOptions,
+) -> Result<NativeNvencSmokeReport> {
+    native_nvenc_impl::run_native_nvenc_smoke(options)
+}
+
+#[cfg(not(all(target_os = "windows", feature = "native-nvenc")))]
+pub(crate) fn run_native_nvenc_smoke(
+    options: NativeNvencSmokeOptions,
+) -> Result<NativeNvencSmokeReport> {
+    let _ = (
+        options.source.monitor_index,
+        options.source.timeout_ms,
+        options.output_path,
+        options.frame_count,
+        options.fps,
+    );
+    anyhow::bail!(
+        "native-nvenc-smoke requires Windows and the native-nvenc feature; run: cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke"
     )
 }
 
@@ -313,6 +356,713 @@ mod ffmpeg_impl {
             assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
             assert!(args.contains(&"scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p".to_string()));
             assert_eq!(args.last().map(String::as_str), Some("out.h264"));
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "native-nvenc"))]
+mod native_nvenc_impl {
+    use std::{fs, io::Write, panic::AssertUnwindSafe, time::Instant};
+
+    use anyhow::{Context, Result, anyhow, bail};
+    use nvenc::{
+        bitstream::BitStream,
+        encoder::Encoder,
+        session::{InitParams, NeedsConfig, Session},
+        sys::{
+            enums::{
+                NVencBufferFormat, NVencParamsRcMode, NVencPicStruct, NVencPicType, NVencTuningInfo,
+            },
+            guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID},
+        },
+    };
+    use tracing::info;
+    use windows::{
+        Win32::Graphics::{
+            Direct3D::{
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile, ID3DBlob, ID3DInclude,
+            },
+            Direct3D11::{
+                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_NEVER,
+                D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+                D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11ClassInstance,
+                ID3D11ClassLinkage, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
+                ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11Texture2D,
+                ID3D11VertexShader,
+            },
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+        },
+        core::PCSTR,
+    };
+    use windows_capture::{
+        dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat},
+        monitor::Monitor,
+    };
+
+    use super::{NativeNvencSmokeOptions, NativeNvencSmokeReport, h264_nal_unit_count};
+
+    pub(crate) fn run_native_nvenc_smoke(
+        options: NativeNvencSmokeOptions,
+    ) -> Result<NativeNvencSmokeReport> {
+        if let Some(parent) = options.output_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create native NVENC smoke output directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let mut source =
+            DxgiTextureSource::new(options.source.monitor_index, options.source.timeout_ms)?;
+        let first_frame = source.next_frame()?;
+        let width = first_frame.width();
+        let height = first_frame.height();
+        let source_format = format!("{:?}", first_frame.format());
+        let gpu_converter = if needs_bgra_gpu_conversion(first_frame.format()) {
+            Some(Bgra8GpuConverter::new(
+                first_frame.device(),
+                first_frame.device_context(),
+                width,
+                height,
+            )?)
+        } else {
+            None
+        };
+        let nvenc_format = if gpu_converter.is_some() {
+            NVencBufferFormat::ARGB
+        } else {
+            nvenc_format_for_dxgi(first_frame.format())?
+        };
+        let nvenc_format_name = nvenc_format_name(first_frame.format(), gpu_converter.is_some())?;
+        let frame_count = options.frame_count.max(1);
+        let fps = options.fps.max(1);
+
+        let encoder = create_encoder(first_frame.device(), width, height, fps, nvenc_format)?;
+        let mut bitstreams = BitstreamPool::new(&encoder)?;
+        let mut out = fs::File::create(&options.output_path).with_context(|| {
+            format!(
+                "failed to create native NVENC output {}",
+                options.output_path.display()
+            )
+        })?;
+
+        info!(
+            output = %options.output_path.display(),
+            width,
+            height,
+            frames = frame_count,
+            fps,
+            source_format = %source_format,
+            nvenc_format = %nvenc_format_name,
+            "starting native D3D11 zero-copy NVENC smoke"
+        );
+
+        let started = Instant::now();
+        encode_frame(
+            &encoder,
+            &mut bitstreams,
+            &mut out,
+            gpu_converter.as_ref(),
+            &first_frame,
+            0,
+        )?;
+        drop(first_frame);
+
+        for frame_index in 1..frame_count {
+            let frame = source.next_frame()?;
+            if frame.width() != width || frame.height() != height {
+                bail!(
+                    "capture frame size changed from {width}x{height} to {}x{}",
+                    frame.width(),
+                    frame.height()
+                );
+            }
+            encode_frame(
+                &encoder,
+                &mut bitstreams,
+                &mut out,
+                gpu_converter.as_ref(),
+                &frame,
+                frame_index as usize,
+            )?;
+        }
+
+        flush_encoder(&encoder, &mut bitstreams, &mut out)?;
+        out.flush().context("failed to flush native NVENC output")?;
+        let elapsed = started.elapsed();
+
+        let encoded = fs::read(&options.output_path).with_context(|| {
+            format!(
+                "failed to read native NVENC output {}",
+                options.output_path.display()
+            )
+        })?;
+        let nal_units = h264_nal_unit_count(&encoded);
+        if nal_units == 0 {
+            bail!("native NVENC output contained no Annex B NAL start codes");
+        }
+        let bytes_written = encoded.len() as u64;
+
+        info!(
+            output = %options.output_path.display(),
+            width,
+            height,
+            frames = frame_count,
+            elapsed_ms = elapsed.as_millis(),
+            bytes_written,
+            nal_units,
+            "native D3D11 zero-copy NVENC smoke completed"
+        );
+
+        Ok(NativeNvencSmokeReport {
+            output_path: options.output_path,
+            width,
+            height,
+            frames: frame_count,
+            elapsed,
+            bytes_written,
+            nal_units,
+            source_format,
+        })
+    }
+
+    struct DxgiTextureSource {
+        duplication: DxgiDuplicationApi,
+        timeout_ms: u32,
+    }
+
+    impl DxgiTextureSource {
+        fn new(monitor_index: Option<usize>, timeout_ms: u32) -> Result<Self> {
+            let monitor = match monitor_index {
+                Some(index) => Monitor::from_index(index)
+                    .with_context(|| format!("failed to select monitor {index}"))?,
+                None => Monitor::primary().context("failed to select primary monitor")?,
+            };
+            let monitor_index = monitor.index().unwrap_or(monitor_index.unwrap_or(1));
+            let monitor_name = monitor.name().unwrap_or_default();
+            let width = monitor.width().context("failed to query monitor width")?;
+            let height = monitor.height().context("failed to query monitor height")?;
+            info!(
+                monitor_index,
+                monitor_name = %monitor_name,
+                width,
+                height,
+                "starting zero-copy DXGI texture source"
+            );
+            Ok(Self {
+                duplication: DxgiDuplicationApi::new(monitor)
+                    .context("failed to create DXGI duplication session")?,
+                timeout_ms: timeout_ms.max(1),
+            })
+        }
+
+        fn next_frame(
+            &mut self,
+        ) -> Result<windows_capture::dxgi_duplication_api::DxgiDuplicationFrame<'_>> {
+            self.duplication
+                .acquire_next_frame(self.timeout_ms)
+                .context("failed to acquire a DXGI texture frame")
+        }
+    }
+
+    struct Bgra8GpuConverter {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        output_texture: ID3D11Texture2D,
+        render_target: ID3D11RenderTargetView,
+        vertex_shader: ID3D11VertexShader,
+        pixel_shader: ID3D11PixelShader,
+        sampler: ID3D11SamplerState,
+        width: u32,
+        height: u32,
+    }
+
+    impl Bgra8GpuConverter {
+        fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+        ) -> Result<Self> {
+            let mut output_texture = None;
+            let texture_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            unsafe {
+                device
+                    .CreateTexture2D(&texture_desc, None, Some(&mut output_texture))
+                    .context("failed to create GPU BGRA conversion texture")?;
+            }
+            let output_texture =
+                output_texture.context("D3D11 returned no GPU BGRA conversion texture")?;
+
+            let mut render_target = None;
+            unsafe {
+                device
+                    .CreateRenderTargetView(&output_texture, None, Some(&mut render_target))
+                    .context("failed to create GPU BGRA conversion render target")?;
+            }
+            let render_target =
+                render_target.context("D3D11 returned no GPU BGRA conversion render target")?;
+
+            let vertex_bytecode = compile_shader(
+                GPU_CONVERTER_HLSL,
+                c"vs_main".as_ptr().cast(),
+                c"vs_5_0".as_ptr().cast(),
+            )
+            .context("failed to compile GPU conversion vertex shader")?;
+            let pixel_bytecode = compile_shader(
+                GPU_CONVERTER_HLSL,
+                c"ps_main".as_ptr().cast(),
+                c"ps_5_0".as_ptr().cast(),
+            )
+            .context("failed to compile GPU conversion pixel shader")?;
+
+            let mut vertex_shader = None;
+            let mut pixel_shader = None;
+            unsafe {
+                device
+                    .CreateVertexShader(
+                        &vertex_bytecode,
+                        None::<&ID3D11ClassLinkage>,
+                        Some(&mut vertex_shader),
+                    )
+                    .context("failed to create GPU conversion vertex shader")?;
+                device
+                    .CreatePixelShader(
+                        &pixel_bytecode,
+                        None::<&ID3D11ClassLinkage>,
+                        Some(&mut pixel_shader),
+                    )
+                    .context("failed to create GPU conversion pixel shader")?;
+            }
+            let vertex_shader =
+                vertex_shader.context("D3D11 returned no GPU conversion vertex shader")?;
+            let pixel_shader =
+                pixel_shader.context("D3D11 returned no GPU conversion pixel shader")?;
+
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+            };
+            let mut sampler = None;
+            unsafe {
+                device
+                    .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                    .context("failed to create GPU conversion sampler")?;
+            }
+            let sampler = sampler.context("D3D11 returned no GPU conversion sampler")?;
+
+            info!(
+                width,
+                height,
+                output_format = "Bgra8",
+                "created GPU texture converter for NVENC input"
+            );
+
+            Ok(Self {
+                device: device.clone(),
+                context: context.clone(),
+                output_texture,
+                render_target,
+                vertex_shader,
+                pixel_shader,
+                sampler,
+                width,
+                height,
+            })
+        }
+
+        fn convert(&self, input: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
+            let mut shader_resource = None;
+            unsafe {
+                self.device
+                    .CreateShaderResourceView(input, None, Some(&mut shader_resource))
+                    .context("failed to create GPU conversion shader resource")?;
+            }
+            let shader_resource =
+                shader_resource.context("D3D11 returned no GPU conversion shader resource view")?;
+
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: self.width as f32,
+                Height: self.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+
+            unsafe {
+                self.context.RSSetViewports(Some(&[viewport]));
+                self.context.IASetInputLayout(None);
+                self.context
+                    .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                self.context
+                    .VSSetShader(&self.vertex_shader, None::<&[Option<ID3D11ClassInstance>]>);
+                self.context
+                    .PSSetShader(&self.pixel_shader, None::<&[Option<ID3D11ClassInstance>]>);
+                self.context
+                    .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+                self.context
+                    .PSSetShaderResources(0, Some(&[Some(shader_resource)]));
+                self.context
+                    .OMSetRenderTargets(Some(&[Some(self.render_target.clone())]), None);
+                self.context.Draw(3, 0);
+                self.context.PSSetShaderResources(0, Some(&[None]));
+                self.context
+                    .OMSetRenderTargets(Some(&[None]), None::<&ID3D11DepthStencilView>);
+            }
+
+            Ok(&self.output_texture)
+        }
+    }
+
+    struct BitstreamPool {
+        buffers: Vec<BitStream>,
+    }
+
+    impl BitstreamPool {
+        fn new(encoder: &Encoder) -> Result<Self> {
+            Ok(Self {
+                buffers: vec![
+                    encoder.create_bitstream_buffer().map_err(nvenc_error)?,
+                    encoder.create_bitstream_buffer().map_err(nvenc_error)?,
+                ],
+            })
+        }
+
+        fn next(&mut self) -> Result<BitStream> {
+            self.buffers
+                .pop()
+                .ok_or_else(|| anyhow!("native NVENC bitstream pool was empty"))
+        }
+
+        fn recycle(&mut self, bitstream: BitStream) {
+            self.buffers.push(bitstream);
+        }
+    }
+
+    fn create_encoder(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        fps: u32,
+        format: NVencBufferFormat,
+    ) -> Result<Encoder> {
+        if !nvenc_runtime_visible() {
+            bail!(
+                "failed to find NVIDIA NVENC runtime nvEncodeAPI64.dll on PATH or in Windows system directories; install or repair the NVIDIA display driver with NVENC support"
+            );
+        }
+        let session: Session<NeedsConfig> =
+            std::panic::catch_unwind(AssertUnwindSafe(|| Session::open_dx(device)))
+                .map_err(|_| {
+                    anyhow!(
+                        "failed to load NVIDIA NVENC runtime nvEncodeAPI64.dll; install or repair the NVIDIA display driver with NVENC support"
+                    )
+                })?
+                .map_err(nvenc_error)?;
+        let (session, mut config) = session
+            .get_encode_preset_config_ex(
+                NV_ENC_CODEC_H264_GUID,
+                NV_ENC_PRESET_P3_GUID,
+                NVencTuningInfo::UltraLowLatency,
+            )
+            .map_err(nvenc_error)?;
+
+        config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
+        config.preset_cfg.rc_params.average_bit_rate = 20_000_000;
+        config.preset_cfg.gop_len = fps;
+        config.preset_cfg.frame_interval_p = 1;
+
+        let init_params = InitParams {
+            encode_guid: NV_ENC_CODEC_H264_GUID,
+            preset_guid: NV_ENC_PRESET_P3_GUID,
+            resolution: [width, height],
+            aspect_ratio: [width, height],
+            frame_rate: [fps, 1],
+            tuning_info: NVencTuningInfo::UltraLowLatency,
+            buffer_format: format,
+            encode_config: &mut config.preset_cfg,
+            enable_ptd: true,
+            max_encoder_resolution: [0, 0],
+        };
+
+        session.init_encoder(init_params).map_err(nvenc_error)
+    }
+
+    fn nvenc_runtime_visible() -> bool {
+        let dll_name = "nvEncodeAPI64.dll";
+        if std::env::current_dir()
+            .map(|path| path.join(dll_name).is_file())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let system_root = std::path::PathBuf::from(system_root);
+            if system_root.join("System32").join(dll_name).is_file()
+                || system_root.join("SysWOW64").join(dll_name).is_file()
+            {
+                return true;
+            }
+        }
+
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|entry| entry.join(dll_name).is_file()))
+            .unwrap_or(false)
+    }
+
+    fn encode_frame(
+        encoder: &Encoder,
+        bitstreams: &mut BitstreamPool,
+        out: &mut fs::File,
+        gpu_converter: Option<&Bgra8GpuConverter>,
+        frame: &windows_capture::dxgi_duplication_api::DxgiDuplicationFrame<'_>,
+        frame_index: usize,
+    ) -> Result<()> {
+        let (texture, register_format, pitch) = if needs_bgra_gpu_conversion(frame.format()) {
+            let converter = gpu_converter.context(
+                "captured frame format requires GPU conversion, but no converter was created",
+            )?;
+            (
+                converter.convert(frame.texture())?,
+                NVencBufferFormat::ARGB,
+                frame.width() * 4,
+            )
+        } else {
+            (
+                frame.texture(),
+                nvenc_format_for_dxgi(frame.format())?,
+                frame.width() * 4,
+            )
+        };
+        let registered = encoder
+            .register_resource_dx11(texture, register_format, pitch)
+            .map_err(nvenc_error)?;
+        let bitstream = bitstreams.next()?;
+        let encode_format = if needs_bgra_gpu_conversion(frame.format()) {
+            NVencBufferFormat::ARGB
+        } else {
+            nvenc_format_for_dxgi(frame.format())?
+        };
+        encoder
+            .encode_picture(
+                &registered,
+                &bitstream,
+                frame_index,
+                frame_index as u64,
+                encode_format,
+                NVencPicStruct::Frame,
+                if frame_index == 0 {
+                    NVencPicType::IDR
+                } else {
+                    NVencPicType::P
+                },
+                None,
+            )
+            .map_err(nvenc_error)?;
+        drop(registered);
+
+        write_bitstream(out, &bitstream)?;
+        bitstreams.recycle(bitstream);
+        Ok(())
+    }
+
+    fn flush_encoder(
+        encoder: &Encoder,
+        bitstreams: &mut BitstreamPool,
+        out: &mut fs::File,
+    ) -> Result<()> {
+        encoder.end_encode().map_err(nvenc_error)?;
+        let bitstream = bitstreams.next()?;
+        write_bitstream(out, &bitstream)?;
+        bitstreams.recycle(bitstream);
+        Ok(())
+    }
+
+    fn write_bitstream(out: &mut fs::File, bitstream: &BitStream) -> Result<()> {
+        let lock = bitstream.try_lock(true).map_err(nvenc_error)?;
+        out.write_all(lock.as_slice())
+            .context("failed to write native NVENC bitstream")?;
+        Ok(())
+    }
+
+    fn nvenc_format_for_dxgi(format: DxgiDuplicationFormat) -> Result<NVencBufferFormat> {
+        match format {
+            DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {
+                Ok(NVencBufferFormat::ARGB)
+            }
+            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
+                Ok(NVencBufferFormat::ABGR)
+            }
+            DxgiDuplicationFormat::Rgba16F
+            | DxgiDuplicationFormat::Rgb10A2
+            | DxgiDuplicationFormat::Rgb10XrA2 => {
+                bail!(
+                    "native NVENC zero-copy currently needs an 8-bit desktop surface; got {format:?}"
+                )
+            }
+        }
+    }
+
+    fn needs_bgra_gpu_conversion(format: DxgiDuplicationFormat) -> bool {
+        matches!(
+            format,
+            DxgiDuplicationFormat::Rgba16F
+                | DxgiDuplicationFormat::Rgb10A2
+                | DxgiDuplicationFormat::Rgb10XrA2
+        )
+    }
+
+    fn nvenc_format_name(
+        format: DxgiDuplicationFormat,
+        using_gpu_converter: bool,
+    ) -> Result<&'static str> {
+        if using_gpu_converter {
+            return Ok("ARGB via GPU BGRA8 conversion");
+        }
+        match format {
+            DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => Ok("ARGB"),
+            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => Ok("ABGR"),
+            DxgiDuplicationFormat::Rgba16F
+            | DxgiDuplicationFormat::Rgb10A2
+            | DxgiDuplicationFormat::Rgb10XrA2 => {
+                bail!(
+                    "native NVENC zero-copy currently needs an 8-bit desktop surface; got {format:?}"
+                )
+            }
+        }
+    }
+
+    fn compile_shader(source: &[u8], entry: *const u8, target: *const u8) -> Result<Vec<u8>> {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        let result = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR(c"sunrise_gpu_converter.hlsl".as_ptr().cast()),
+                None,
+                None::<&ID3DInclude>,
+                PCSTR(entry),
+                PCSTR(target),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(err) = result {
+            let message = errors
+                .as_ref()
+                .map(blob_string)
+                .unwrap_or_else(|| "no shader compiler diagnostics".to_string());
+            return Err(anyhow!("D3DCompile failed: {err}; {message}"));
+        }
+        let code = code.context("D3DCompile returned no shader bytecode")?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        Ok(bytes.to_vec())
+    }
+
+    fn blob_string(blob: &ID3DBlob) -> String {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        String::from_utf8_lossy(bytes).trim().to_string()
+    }
+
+    const GPU_CONVERTER_HLSL: &[u8] = br#"
+struct VsOut {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VsOut vs_main(uint vertex_id : SV_VertexID) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+    };
+    float2 uvs[3] = {
+        float2(0.0, 1.0),
+        float2(0.0, -1.0),
+        float2(2.0, 1.0)
+    };
+
+    VsOut output;
+    output.position = float4(positions[vertex_id], 0.0, 1.0);
+    output.uv = uvs[vertex_id];
+    return output;
+}
+
+Texture2D<float4> source_texture : register(t0);
+SamplerState source_sampler : register(s0);
+
+float4 ps_main(VsOut input) : SV_Target {
+    float4 color = source_texture.Sample(source_sampler, input.uv);
+    color.rgb = max(color.rgb, 0.0);
+    color.rgb = color.rgb / (1.0 + color.rgb);
+    color.rgb = pow(saturate(color.rgb), 1.0 / 2.2);
+    return float4(color.rgb, 1.0);
+}
+"#;
+
+    fn nvenc_error(error: nvenc::sys::result::NVencError) -> anyhow::Error {
+        anyhow!("NVENC error: {error:?}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn maps_dxgi_bgra_to_nvenc_argb() {
+            assert_eq!(
+                nvenc_format_name(DxgiDuplicationFormat::Bgra8, false).unwrap(),
+                "ARGB"
+            );
+        }
+
+        #[test]
+        fn maps_dxgi_rgba_to_nvenc_abgr() {
+            assert_eq!(
+                nvenc_format_name(DxgiDuplicationFormat::Rgba8, false).unwrap(),
+                "ABGR"
+            );
+        }
+
+        #[test]
+        fn routes_hdr_formats_through_gpu_converter() {
+            assert!(needs_bgra_gpu_conversion(DxgiDuplicationFormat::Rgba16F));
+            assert_eq!(
+                nvenc_format_name(DxgiDuplicationFormat::Rgba16F, true).unwrap(),
+                "ARGB via GPU BGRA8 conversion"
+            );
         }
     }
 }

@@ -97,6 +97,23 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Command::NativeNvencSmoke(options) = command {
+        let report = encoder::run_native_nvenc_smoke(options)?;
+        let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
+        info!(
+            output = %report.output_path.display(),
+            width = report.width,
+            height = report.height,
+            frames = report.frames,
+            elapsed_ms = report.elapsed.as_millis(),
+            fps,
+            bytes_written = report.bytes_written,
+            nal_units = report.nal_units,
+            source_format = %report.source_format,
+            "native D3D11 zero-copy NVENC smoke completed"
+        );
+        return Ok(());
+    }
     let Command::Serve { config_path } = command else {
         unreachable!("capture smoke command returns before daemon startup");
     };
@@ -183,6 +200,7 @@ enum Command {
     CaptureSmoke(capture::CaptureSmokeOptions),
     CaptureLoop(capture::CaptureLoopOptions),
     EncodeSmoke(encoder::EncodeSmokeOptions),
+    NativeNvencSmoke(encoder::NativeNvencSmokeOptions),
 }
 
 fn parse_command() -> Result<Command> {
@@ -214,6 +232,10 @@ fn parse_command() -> Result<Command> {
         Some("encode-smoke") => {
             args.next();
             parse_encode_smoke(args).map(Command::EncodeSmoke)
+        }
+        Some("native-nvenc-smoke") => {
+            args.next();
+            parse_native_nvenc_smoke(args).map(Command::NativeNvencSmoke)
         }
         _ => Err(anyhow!(usage())),
     }
@@ -399,8 +421,74 @@ where
     })
 }
 
+fn parse_native_nvenc_smoke<I>(args: I) -> Result<encoder::NativeNvencSmokeOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut output_path = PathBuf::from("target/capture-smoke/native-nvenc.h264");
+    let mut frame_count = 120_u32;
+    let mut fps = 30_u32;
+    let mut monitor_index = None;
+    let mut timeout_ms = 33_u32;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--output" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --output"));
+                };
+                output_path = PathBuf::from(value);
+            }
+            "--frames" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --frames"));
+                };
+                frame_count = value
+                    .parse::<u32>()
+                    .context("failed to parse --frames as a frame count")?;
+            }
+            "--fps" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --fps"));
+                };
+                fps = value.parse::<u32>().context("failed to parse --fps")?;
+            }
+            "--monitor" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --monitor"));
+                };
+                monitor_index = Some(
+                    value
+                        .parse::<usize>()
+                        .context("failed to parse --monitor as a one-based monitor index")?,
+                );
+            }
+            "--timeout-ms" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --timeout-ms"));
+                };
+                timeout_ms = value
+                    .parse::<u32>()
+                    .context("failed to parse --timeout-ms as milliseconds")?;
+            }
+            _ => return Err(anyhow!(usage())),
+        }
+    }
+
+    Ok(encoder::NativeNvencSmokeOptions {
+        source: capture::CaptureSourceOptions {
+            monitor_index,
+            timeout_ms,
+        },
+        output_path,
+        frame_count,
+        fps,
+    })
+}
+
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
