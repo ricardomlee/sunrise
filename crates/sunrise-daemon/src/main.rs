@@ -1,3 +1,4 @@
+mod capture;
 mod control;
 mod identity;
 mod media;
@@ -44,7 +45,26 @@ pub(crate) struct AppState {
 async fn main() -> Result<()> {
     init_logging();
 
-    let config_path = parse_config_path()?;
+    let command = parse_command()?;
+    if let Command::CaptureSmoke(options) = command {
+        let report = capture::run_capture_smoke(options)?;
+        info!(
+            output = %report.output_path.display(),
+            monitor_index = report.monitor_index,
+            monitor_name = report.monitor_name.as_deref().unwrap_or("unknown"),
+            width = report.width,
+            height = report.height,
+            row_pitch = report.row_pitch,
+            depth_pitch = report.depth_pitch,
+            color_format = %report.color_format,
+            bytes_written = report.bytes_written,
+            "Windows capture smoke completed"
+        );
+        return Ok(());
+    }
+    let Command::Serve { config_path } = command else {
+        unreachable!("capture smoke command returns before daemon startup");
+    };
     let (mut config, created) = load_or_generate(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
     if created {
@@ -123,15 +143,85 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-fn parse_config_path() -> Result<PathBuf> {
-    let mut args = std::env::args().skip(1);
-    match (args.next().as_deref(), args.next(), args.next()) {
-        (None, None, None) => Ok(default_config_path()),
-        (Some("--config"), Some(path), None) => Ok(PathBuf::from(path)),
-        _ => Err(anyhow!(
-            "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]"
-        )),
+enum Command {
+    Serve { config_path: PathBuf },
+    CaptureSmoke(capture::CaptureSmokeOptions),
+}
+
+fn parse_command() -> Result<Command> {
+    let mut args = std::env::args().skip(1).peekable();
+    match args.peek().map(String::as_str) {
+        None => Ok(Command::Serve {
+            config_path: default_config_path(),
+        }),
+        Some("--config") => {
+            args.next();
+            let Some(path) = args.next() else {
+                return Err(anyhow!("missing path after --config"));
+            };
+            if args.next().is_some() {
+                return Err(anyhow!(usage()));
+            }
+            Ok(Command::Serve {
+                config_path: PathBuf::from(path),
+            })
+        }
+        Some("capture-smoke") => {
+            args.next();
+            parse_capture_smoke(args).map(Command::CaptureSmoke)
+        }
+        _ => Err(anyhow!(usage())),
     }
+}
+
+fn parse_capture_smoke<I>(args: I) -> Result<capture::CaptureSmokeOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut output_path = PathBuf::from("target/capture-smoke/frame.bmp");
+    let mut monitor_index = None;
+    let mut timeout_ms = 33_u32;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--output" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --output"));
+                };
+                output_path = PathBuf::from(value);
+            }
+            "--monitor" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --monitor"));
+                };
+                monitor_index = Some(
+                    value
+                        .parse::<usize>()
+                        .context("failed to parse --monitor as a one-based monitor index")?,
+                );
+            }
+            "--timeout-ms" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --timeout-ms"));
+                };
+                timeout_ms = value
+                    .parse::<u32>()
+                    .context("failed to parse --timeout-ms as milliseconds")?;
+            }
+            _ => return Err(anyhow!(usage())),
+        }
+    }
+
+    Ok(capture::CaptureSmokeOptions {
+        output_path,
+        monitor_index,
+        timeout_ms,
+    })
+}
+
+fn usage() -> &'static str {
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {

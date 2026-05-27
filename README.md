@@ -69,6 +69,16 @@ $env:SUNRISE_H264_PATH = "C:\path\to\sample.h264"
 cargo run -p sunrise-daemon
 ```
 
+## Windows Capture Smoke Test
+
+The first native Windows capture path is available behind the `capture-windows` feature. It uses `windows-capture` with DXGI Desktop Duplication to grab one monitor frame and writes a 32-bit BGRA BMP:
+
+```powershell
+cargo run -p sunrise-daemon --features capture-windows -- capture-smoke --output target\capture-smoke\frame.bmp
+```
+
+This must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. This command only validates frame acquisition; it is not yet wired into RTSP video or NVENC.
+
 If your Moonlight install is in a different location:
 
 ```powershell
@@ -117,9 +127,10 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
 - RTP video is driven through the media framework, but the only implemented video source is still a file-backed H.264 simulator.
 - Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
+- Windows capture has a one-frame DXGI smoke test, but live capture is not connected to the media pipeline yet.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
-- No video capture, audio capture, NVENC, or Windows screen capture implementation exists yet.
+- No live video capture loop, audio capture, or NVENC implementation exists yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
 ## Next Milestones
@@ -127,5 +138,6 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 1. Verify the `/launch` and RTSP skeleton against more Moonlight clients.
 2. Gate HTTPS APIs by paired client certificates.
 3. Add GameStream ENet control message parsing and required control replies.
-4. Replace the file-backed `AnnexBVideoSource` with a live encoded source fed by Windows capture plus NVENC.
-5. Add real audio capture, Opus encoding, and GameStream audio encryption.
+4. Promote the one-frame Windows capture smoke path into a live frame source.
+5. Replace the file-backed `AnnexBVideoSource` with a live encoded source fed by Windows capture plus NVENC.
+6. Add real audio capture, Opus encoding, and GameStream audio encryption.
