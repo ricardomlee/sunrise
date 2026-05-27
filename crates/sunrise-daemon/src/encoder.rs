@@ -390,12 +390,18 @@ mod native_nvenc_impl {
                 ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11Texture2D,
                 ID3D11VertexShader,
             },
-            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+            Dxgi::Common::{
+                DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC,
+            },
         },
         core::PCSTR,
     };
     use windows_capture::{
-        dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat},
+        dxgi_duplication_api::{
+            DxgiDuplicationApi, DxgiDuplicationFormat, DxgiDuplicationFrame,
+            Error as DxgiDuplicationError,
+        },
         monitor::Monitor,
     };
 
@@ -418,27 +424,29 @@ mod native_nvenc_impl {
         let first_frame = source.next_frame()?;
         let width = first_frame.width();
         let height = first_frame.height();
-        let source_format = format!("{:?}", first_frame.format());
-        let gpu_converter = if needs_bgra_gpu_conversion(first_frame.format()) {
-            Some(Bgra8GpuConverter::new(
-                first_frame.device(),
-                first_frame.device_context(),
-                width,
-                height,
-            )?)
-        } else {
-            None
-        };
-        let nvenc_format = if gpu_converter.is_some() {
-            NVencBufferFormat::ARGB
-        } else {
-            nvenc_format_for_dxgi(first_frame.format())?
-        };
-        let nvenc_format_name = nvenc_format_name(first_frame.format(), gpu_converter.is_some())?;
+        let source_dxgi_format = first_frame.format();
+        let source_format = format!("{source_dxgi_format:?}");
+        let input_stage = NvencInputStage::new(
+            first_frame.device(),
+            first_frame.device_context(),
+            width,
+            height,
+            source_dxgi_format,
+        )?;
+        input_stage.update_from_frame(&first_frame)?;
+        drop(first_frame);
+
+        let nvenc_format_name = input_stage.nvenc_format_name();
         let frame_count = options.frame_count.max(1);
         let fps = options.fps.max(1);
 
-        let encoder = create_encoder(first_frame.device(), width, height, fps, nvenc_format)?;
+        let encoder = create_encoder(
+            input_stage.device(),
+            width,
+            height,
+            fps,
+            input_stage.nvenc_format(),
+        )?;
         let mut bitstreams = BitstreamPool::new(&encoder)?;
         let mut out = fs::File::create(&options.output_path).with_context(|| {
             format!(
@@ -459,31 +467,33 @@ mod native_nvenc_impl {
         );
 
         let started = Instant::now();
-        encode_frame(
-            &encoder,
-            &mut bitstreams,
-            &mut out,
-            gpu_converter.as_ref(),
-            &first_frame,
-            0,
-        )?;
-        drop(first_frame);
+        encode_input_stage(&encoder, &mut bitstreams, &mut out, &input_stage, 0)?;
+        let mut reused_frames = 0_u32;
 
         for frame_index in 1..frame_count {
-            let frame = source.next_frame()?;
-            if frame.width() != width || frame.height() != height {
-                bail!(
-                    "capture frame size changed from {width}x{height} to {}x{}",
-                    frame.width(),
-                    frame.height()
-                );
+            match source.next_frame() {
+                Ok(frame) => {
+                    if frame.width() != width || frame.height() != height {
+                        bail!(
+                            "capture frame size changed from {width}x{height} to {}x{}",
+                            frame.width(),
+                            frame.height()
+                        );
+                    }
+                    input_stage.update_from_frame(&frame)?;
+                }
+                Err(err) if should_reuse_last_frame(&err) => {
+                    reused_frames += 1;
+                }
+                Err(err) => {
+                    return Err(err).context("failed to acquire a DXGI texture frame");
+                }
             }
-            encode_frame(
+            encode_input_stage(
                 &encoder,
                 &mut bitstreams,
                 &mut out,
-                gpu_converter.as_ref(),
-                &frame,
+                &input_stage,
                 frame_index as usize,
             )?;
         }
@@ -512,6 +522,7 @@ mod native_nvenc_impl {
             elapsed_ms = elapsed.as_millis(),
             bytes_written,
             nal_units,
+            reused_frames,
             "native D3D11 zero-copy NVENC smoke completed"
         );
 
@@ -559,10 +570,156 @@ mod native_nvenc_impl {
 
         fn next_frame(
             &mut self,
-        ) -> Result<windows_capture::dxgi_duplication_api::DxgiDuplicationFrame<'_>> {
-            self.duplication
-                .acquire_next_frame(self.timeout_ms)
-                .context("failed to acquire a DXGI texture frame")
+        ) -> std::result::Result<DxgiDuplicationFrame<'_>, DxgiDuplicationError> {
+            self.duplication.acquire_next_frame(self.timeout_ms)
+        }
+    }
+
+    enum NvencInputStage {
+        Copy(D3D11CopyFrameBuffer),
+        Convert(Bgra8GpuConverter),
+    }
+
+    impl NvencInputStage {
+        fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+            source_format: DxgiDuplicationFormat,
+        ) -> Result<Self> {
+            if needs_bgra_gpu_conversion(source_format) {
+                Ok(Self::Convert(Bgra8GpuConverter::new(
+                    device, context, width, height,
+                )?))
+            } else {
+                Ok(Self::Copy(D3D11CopyFrameBuffer::new(
+                    device,
+                    context,
+                    width,
+                    height,
+                    source_format,
+                )?))
+            }
+        }
+
+        fn update_from_frame(&self, frame: &DxgiDuplicationFrame<'_>) -> Result<()> {
+            match self {
+                Self::Copy(buffer) => buffer.copy_from(frame.texture(), frame.format()),
+                Self::Convert(converter) => converter.convert(frame.texture()).map(|_| ()),
+            }
+        }
+
+        fn device(&self) -> &ID3D11Device {
+            match self {
+                Self::Copy(buffer) => &buffer.device,
+                Self::Convert(converter) => &converter.device,
+            }
+        }
+
+        fn texture(&self) -> &ID3D11Texture2D {
+            match self {
+                Self::Copy(buffer) => &buffer.texture,
+                Self::Convert(converter) => &converter.output_texture,
+            }
+        }
+
+        fn nvenc_format(&self) -> NVencBufferFormat {
+            match self {
+                Self::Copy(buffer) => buffer.nvenc_format(),
+                Self::Convert(_) => NVencBufferFormat::ARGB,
+            }
+        }
+
+        fn nvenc_format_name(&self) -> &'static str {
+            match self {
+                Self::Copy(buffer) => buffer.nvenc_format_name(),
+                Self::Convert(_) => "ARGB via GPU BGRA8 conversion",
+            }
+        }
+
+        fn pitch(&self) -> u32 {
+            match self {
+                Self::Copy(buffer) => buffer.width * 4,
+                Self::Convert(converter) => converter.width * 4,
+            }
+        }
+    }
+
+    struct D3D11CopyFrameBuffer {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        texture: ID3D11Texture2D,
+        source_format: DxgiDuplicationFormat,
+        width: u32,
+    }
+
+    impl D3D11CopyFrameBuffer {
+        fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+            source_format: DxgiDuplicationFormat,
+        ) -> Result<Self> {
+            let mut texture = None;
+            let texture_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: copy_texture_format(source_format)?,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            unsafe {
+                device
+                    .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                    .context("failed to create persistent NVENC input texture")?;
+            }
+            let texture = texture.context("D3D11 returned no persistent NVENC input texture")?;
+
+            Ok(Self {
+                device: device.clone(),
+                context: context.clone(),
+                texture,
+                source_format,
+                width,
+            })
+        }
+
+        fn copy_from(
+            &self,
+            input: &ID3D11Texture2D,
+            input_format: DxgiDuplicationFormat,
+        ) -> Result<()> {
+            if input_format != self.source_format {
+                bail!(
+                    "capture frame format changed from {:?} to {:?}",
+                    self.source_format,
+                    input_format
+                );
+            }
+            unsafe {
+                self.context.CopyResource(&self.texture, input);
+            }
+            Ok(())
+        }
+
+        fn nvenc_format(&self) -> NVencBufferFormat {
+            nvenc_format_for_dxgi(self.source_format)
+                .expect("copy input stage only accepts NVENC-compatible DXGI formats")
+        }
+
+        fn nvenc_format_name(&self) -> &'static str {
+            nvenc_format_name(self.source_format, false)
+                .expect("copy input stage only accepts NVENC-compatible DXGI formats")
         }
     }
 
@@ -835,46 +992,32 @@ mod native_nvenc_impl {
             .unwrap_or(false)
     }
 
-    fn encode_frame(
+    fn should_reuse_last_frame(error: &DxgiDuplicationError) -> bool {
+        matches!(error, DxgiDuplicationError::Timeout)
+    }
+
+    fn encode_input_stage(
         encoder: &Encoder,
         bitstreams: &mut BitstreamPool,
         out: &mut fs::File,
-        gpu_converter: Option<&Bgra8GpuConverter>,
-        frame: &windows_capture::dxgi_duplication_api::DxgiDuplicationFrame<'_>,
+        input_stage: &NvencInputStage,
         frame_index: usize,
     ) -> Result<()> {
-        let (texture, register_format, pitch) = if needs_bgra_gpu_conversion(frame.format()) {
-            let converter = gpu_converter.context(
-                "captured frame format requires GPU conversion, but no converter was created",
-            )?;
-            (
-                converter.convert(frame.texture())?,
-                NVencBufferFormat::ARGB,
-                frame.width() * 4,
-            )
-        } else {
-            (
-                frame.texture(),
-                nvenc_format_for_dxgi(frame.format())?,
-                frame.width() * 4,
-            )
-        };
         let registered = encoder
-            .register_resource_dx11(texture, register_format, pitch)
+            .register_resource_dx11(
+                input_stage.texture(),
+                input_stage.nvenc_format(),
+                input_stage.pitch(),
+            )
             .map_err(nvenc_error)?;
         let bitstream = bitstreams.next()?;
-        let encode_format = if needs_bgra_gpu_conversion(frame.format()) {
-            NVencBufferFormat::ARGB
-        } else {
-            nvenc_format_for_dxgi(frame.format())?
-        };
         encoder
             .encode_picture(
                 &registered,
                 &bitstream,
                 frame_index,
                 frame_index as u64,
-                encode_format,
+                input_stage.nvenc_format(),
                 NVencPicStruct::Frame,
                 if frame_index == 0 {
                     NVencPicType::IDR
@@ -924,6 +1067,20 @@ mod native_nvenc_impl {
                 bail!(
                     "native NVENC zero-copy currently needs an 8-bit desktop surface; got {format:?}"
                 )
+            }
+        }
+    }
+
+    fn copy_texture_format(format: DxgiDuplicationFormat) -> Result<DXGI_FORMAT> {
+        match format {
+            DxgiDuplicationFormat::Bgra8 => Ok(DXGI_FORMAT_B8G8R8A8_UNORM),
+            DxgiDuplicationFormat::Bgra8Srgb => Ok(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+            DxgiDuplicationFormat::Rgba8 => Ok(DXGI_FORMAT_R8G8B8A8_UNORM),
+            DxgiDuplicationFormat::Rgba8Srgb => Ok(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+            DxgiDuplicationFormat::Rgba16F
+            | DxgiDuplicationFormat::Rgb10A2
+            | DxgiDuplicationFormat::Rgb10XrA2 => {
+                bail!("HDR/10-bit formats require the GPU BGRA conversion stage")
             }
         }
     }
@@ -1063,6 +1220,11 @@ float4 ps_main(VsOut input) : SV_Target {
                 nvenc_format_name(DxgiDuplicationFormat::Rgba16F, true).unwrap(),
                 "ARGB via GPU BGRA8 conversion"
             );
+        }
+
+        #[test]
+        fn reuses_last_frame_when_dxgi_times_out() {
+            assert!(should_reuse_last_frame(&DxgiDuplicationError::Timeout));
         }
     }
 }

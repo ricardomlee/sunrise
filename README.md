@@ -99,6 +99,8 @@ cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke --fram
 
 If the desktop is exposed as HDR/scRGB (`Rgba16F`) or 10-bit RGB, sunrise performs a GPU render pass into a BGRA8 D3D11 texture before NVENC registration. This keeps the native path on the GPU side; it does not pipe raw frames through ffmpeg or a CPU raw-video boundary. This command requires an NVIDIA driver that exposes `nvEncodeAPI64.dll`.
 
+DXGI Desktop Duplication only produces a new frame when the desktop changes. During the native NVENC smoke test, sunrise keeps a persistent GPU input texture and reuses the last captured frame when `AcquireNextFrame` times out, so a static desktop can still produce the requested number of encoded frames.
+
 If your Moonlight install is in a different location:
 
 ```powershell
