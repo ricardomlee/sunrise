@@ -323,7 +323,7 @@ where
 {
     let mut output_path = PathBuf::from("target/capture-smoke/capture.h264");
     let mut ffmpeg_path = PathBuf::from("ffmpeg.exe");
-    let mut encoder = "h264_nvenc".to_string();
+    let mut encoder = "auto".to_string();
     let mut frame_count = 120_u32;
     let mut fps = 30_u32;
     let mut monitor_index = None;
@@ -400,7 +400,7 @@ where
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder h264_nvenc] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {

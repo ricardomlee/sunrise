@@ -58,13 +58,35 @@ mod ffmpeg_impl {
     };
 
     use anyhow::{Context, Result, bail};
-    use tracing::info;
+    use tracing::{info, warn};
 
     use crate::capture::WindowsCaptureSource;
 
     use super::{EncodeSmokeOptions, EncodeSmokeReport, h264_nal_unit_count};
 
     pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmokeReport> {
+        if options.encoder.eq_ignore_ascii_case("auto") {
+            let mut nvenc_options = options.clone();
+            nvenc_options.encoder = "h264_nvenc".to_string();
+            match run_encode_smoke_once(nvenc_options) {
+                Ok(report) => return Ok(report),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "h264_nvenc encode smoke failed; falling back to libx264"
+                    );
+                }
+            }
+
+            let mut software_options = options;
+            software_options.encoder = "libx264".to_string();
+            return run_encode_smoke_once(software_options);
+        }
+
+        run_encode_smoke_once(options)
+    }
+
+    fn run_encode_smoke_once(options: EncodeSmokeOptions) -> Result<EncodeSmokeReport> {
         if let Some(parent) = options.output_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -109,25 +131,26 @@ mod ffmpeg_impl {
                 )
             })?;
 
-        {
-            let mut stdin = child.stdin.take().context("failed to open ffmpeg stdin")?;
-            stdin
-                .write_all(&first_frame.bgra)
-                .context("failed to write first captured frame to ffmpeg")?;
-            for _ in 1..frame_count {
-                let frame = source.next_frame()?;
-                if frame.width != width || frame.height != height {
-                    bail!(
-                        "capture frame size changed from {width}x{height} to {}x{}",
-                        frame.width,
-                        frame.height
-                    );
-                }
-                stdin
-                    .write_all(&frame.bgra)
-                    .context("failed to write captured frame to ffmpeg")?;
+        let mut stdin = child.stdin.take().context("failed to open ffmpeg stdin")?;
+        if let Err(err) = stdin.write_all(&first_frame.bgra) {
+            drop(stdin);
+            return Err(ffmpeg_write_error(child, err, "first captured frame"));
+        }
+        for _ in 1..frame_count {
+            let frame = source.next_frame()?;
+            if frame.width != width || frame.height != height {
+                bail!(
+                    "capture frame size changed from {width}x{height} to {}x{}",
+                    frame.width,
+                    frame.height
+                );
+            }
+            if let Err(err) = stdin.write_all(&frame.bgra) {
+                drop(stdin);
+                return Err(ffmpeg_write_error(child, err, "captured frame"));
             }
         }
+        drop(stdin);
 
         let output = child
             .wait_with_output()
@@ -207,6 +230,26 @@ mod ffmpeg_impl {
             options.output_path.display().to_string(),
         ]);
         args
+    }
+
+    fn ffmpeg_write_error(
+        child: std::process::Child,
+        err: std::io::Error,
+        frame_context: &str,
+    ) -> anyhow::Error {
+        match child.wait_with_output() {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::anyhow!(
+                    "failed to write {frame_context} to ffmpeg: {err}; ffmpeg exited with {}; stderr:\n{}\nIf h264_nvenc failed, try --encoder libx264 to validate the capture-to-H264 path without NVENC.",
+                    output.status,
+                    stderr.trim()
+                )
+            }
+            Err(wait_err) => anyhow::anyhow!(
+                "failed to write {frame_context} to ffmpeg: {err}; also failed to collect ffmpeg stderr: {wait_err}"
+            ),
+        }
     }
 
     fn append_encoder_args(args: &mut Vec<String>, encoder: &str, fps: u32) {

@@ -83,7 +83,7 @@ The capture source can also run a short continuous loop and report the observed 
 cargo run -p sunrise-daemon --features capture-windows -- capture-loop --frames 120
 ```
 
-To validate the next boundary, capture frames can be encoded to an Annex B H.264 elementary stream with ffmpeg. The default encoder is `h264_nvenc`; pass `--encoder libx264` for a software fallback:
+To validate the next boundary, capture frames can be encoded to an Annex B H.264 elementary stream with ffmpeg. The default encoder is `auto`, which tries `h264_nvenc` first and falls back to `libx264` if NVENC is unavailable:
 
 ```powershell
 cargo run -p sunrise-daemon --features capture-windows -- encode-smoke --frames 120 --fps 30 --output target\capture-smoke\capture.h264
