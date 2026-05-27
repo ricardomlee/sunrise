@@ -1,5 +1,6 @@
 mod control;
 mod identity;
+mod media;
 mod pairing;
 mod rtsp;
 mod tls;

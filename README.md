@@ -103,17 +103,23 @@ sunrise now accepts HTTPS `/launch` for the fake `Desktop` app and returns a pla
 - `GET_PARAMETER`
 - `TEARDOWN`
 
-After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the client's UDP ping, then sends RTP packets. Video packets are sourced from an Annex B H.264 elementary stream via `SUNRISE_H264_PATH`. The sender groups Annex B NAL units into access units and emits Moonlight-style video RTP packets with the RTP extension flag and little-endian NV video headers. Audio currently sends minimal Opus silence packets. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
+After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the client's UDP ping, then sends RTP packets. The RTSP layer now delegates media production to a small framework:
+
+- `AnnexBVideoSource` reads an Annex B H.264 elementary stream from `SUNRISE_H264_PATH`, groups NAL units into access units, and exposes encoded frames.
+- `VideoPacketizer` emits Moonlight-style video RTP packets with the RTP extension flag, little-endian NV video headers, stream packet indices, and frame packet metadata.
+- `OpusSilenceSource` and `AudioPacketizer` provide the temporary audio path.
+
+This keeps the file-backed H.264 source as a test source while leaving a clean place to plug in live Windows capture plus NVENC output later. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
 
 ## Current Limitations
 
 - Client certificate signature verification is not implemented.
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
-- RTP video is a file-backed H.264 simulator, not a live desktop stream.
+- RTP video is driven through the media framework, but the only implemented video source is still a file-backed H.264 simulator.
 - Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
-- No video capture, audio capture, NVENC, or Windows screen capture exists yet.
+- No video capture, audio capture, NVENC, or Windows screen capture implementation exists yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
 ## Next Milestones
@@ -121,5 +127,5 @@ After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the 
 1. Verify the `/launch` and RTSP skeleton against more Moonlight clients.
 2. Gate HTTPS APIs by paired client certificates.
 3. Add GameStream ENet control message parsing and required control replies.
-4. Add RTP video and audio transport scaffolding.
-5. Add Windows capture/encode integration only after the protocol control plane is stable.
+4. Replace the file-backed `AnnexBVideoSource` with a live encoded source fed by Windows capture plus NVENC.
+5. Add real audio capture, Opus encoding, and GameStream audio encryption.
