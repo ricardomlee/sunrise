@@ -437,17 +437,69 @@ async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
 fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
     let video_source = env::var("SUNRISE_VIDEO_SOURCE").ok();
     let live_nvenc = env::var("SUNRISE_LIVE_NVENC").ok();
+    let h264_path = env::var("SUNRISE_H264_PATH").ok();
 
-    if wants_native_nvenc_video_source(video_source.as_deref(), live_nvenc.as_deref()) {
-        return encoder::native_nvenc_video_source_from_env();
+    match select_video_source(
+        video_source.as_deref(),
+        live_nvenc.as_deref(),
+        h264_path.as_deref(),
+    )? {
+        VideoSourceChoice::NativeNvenc => {
+            info!("selected RTSP video source: native-nvenc live capture");
+            encoder::native_nvenc_video_source_from_env()
+        }
+        VideoSourceChoice::AnnexB => {
+            info!("selected RTSP video source: annex-b file");
+            Ok(Box::new(AnnexBVideoSource::from_env()))
+        }
     }
-
-    Ok(Box::new(AnnexBVideoSource::from_env()))
 }
 
-fn wants_native_nvenc_video_source(video_source: Option<&str>, live_nvenc: Option<&str>) -> bool {
-    video_source.is_some_and(|value| value.eq_ignore_ascii_case("native-nvenc"))
-        || live_nvenc.is_some_and(|value| value == "1")
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VideoSourceChoice {
+    NativeNvenc,
+    AnnexB,
+}
+
+fn select_video_source(
+    video_source: Option<&str>,
+    live_nvenc: Option<&str>,
+    h264_path: Option<&str>,
+) -> Result<VideoSourceChoice> {
+    if live_nvenc.is_some_and(|value| value == "1") {
+        return Ok(VideoSourceChoice::NativeNvenc);
+    }
+
+    match video_source
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value)
+            if value.eq_ignore_ascii_case("native-nvenc")
+                || value.eq_ignore_ascii_case("capture") =>
+        {
+            Ok(VideoSourceChoice::NativeNvenc)
+        }
+        Some(value)
+            if value.eq_ignore_ascii_case("annex-b")
+                || value.eq_ignore_ascii_case("file")
+                || value.eq_ignore_ascii_case("h264") =>
+        {
+            Ok(VideoSourceChoice::AnnexB)
+        }
+        Some(value) => {
+            bail!("unsupported SUNRISE_VIDEO_SOURCE={value:?}; expected native-nvenc or annex-b")
+        }
+        None if native_nvenc_video_source_available() => Ok(VideoSourceChoice::NativeNvenc),
+        None if h264_path.is_some_and(|value| !value.trim().is_empty()) => {
+            Ok(VideoSourceChoice::AnnexB)
+        }
+        None => Ok(VideoSourceChoice::AnnexB),
+    }
+}
+
+fn native_nvenc_video_source_available() -> bool {
+    cfg!(all(target_os = "windows", feature = "native-nvenc"))
 }
 
 async fn stream_audio_rtp(socket: Arc<UdpSocket>) -> Result<()> {
@@ -593,11 +645,40 @@ mod tests {
     }
 
     #[test]
-    fn native_nvenc_video_source_is_explicitly_requested() {
-        assert!(wants_native_nvenc_video_source(Some("native-nvenc"), None));
-        assert!(wants_native_nvenc_video_source(Some("NATIVE-NVENC"), None));
-        assert!(wants_native_nvenc_video_source(None, Some("1")));
-        assert!(!wants_native_nvenc_video_source(None, None));
-        assert!(!wants_native_nvenc_video_source(Some("annex-b"), Some("0")));
+    fn native_nvenc_video_source_is_selected_strictly() {
+        assert_eq!(
+            select_video_source(Some("native-nvenc"), None, Some("sample.h264")).unwrap(),
+            VideoSourceChoice::NativeNvenc
+        );
+        assert_eq!(
+            select_video_source(Some("NATIVE-NVENC"), None, None).unwrap(),
+            VideoSourceChoice::NativeNvenc
+        );
+        assert_eq!(
+            select_video_source(None, Some("1"), Some("sample.h264")).unwrap(),
+            VideoSourceChoice::NativeNvenc
+        );
+        assert_eq!(
+            select_video_source(Some("annex-b"), Some("0"), None).unwrap(),
+            VideoSourceChoice::AnnexB
+        );
+    }
+
+    #[test]
+    fn default_video_source_prefers_live_capture_when_compiled_in() {
+        let expected = if native_nvenc_video_source_available() {
+            VideoSourceChoice::NativeNvenc
+        } else {
+            VideoSourceChoice::AnnexB
+        };
+        assert_eq!(
+            select_video_source(None, None, Some("sample.h264")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn invalid_video_source_is_rejected() {
+        assert!(select_video_source(Some("surprise"), None, None).is_err());
     }
 }

@@ -126,6 +126,8 @@ $env:SUNRISE_VIDEO_SOURCE = "native-nvenc"
 cargo run -p sunrise-daemon --features native-nvenc
 ```
 
+When the `native-nvenc` feature is compiled in, the daemon defaults to live capture unless `SUNRISE_VIDEO_SOURCE` is explicitly set to `annex-b`, `file`, or `h264`. This prevents a stale `SUNRISE_H264_PATH` from silently masking capture failures during live testing.
+
 Optional knobs:
 
 ```powershell
@@ -176,17 +178,24 @@ After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the 
 - `VideoPacketizer` emits Moonlight-style video RTP packets with the RTP extension flag, little-endian NV video headers, stream packet indices, and frame packet metadata.
 - `OpusSilenceSource` and `AudioPacketizer` provide the temporary audio path.
 
-This keeps the file-backed H.264 source as a test source while leaving a clean place to plug in live Windows capture plus NVENC output later. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
+For file-backed smoke testing with a native build, select the file source explicitly:
+
+```powershell
+$env:SUNRISE_VIDEO_SOURCE = "annex-b"
+$env:SUNRISE_H264_PATH = "C:\path\to\sample.h264"
+```
+
+This keeps the file-backed H.264 source as an explicit test source while leaving a clean place for live Windows capture plus NVENC output. The RTSP control `SETUP` also starts a minimal ENet listener on UDP `47999` so Moonlight can establish the control stream transport.
 
 ## Current Limitations
 
 - Client certificate signature verification is not implemented.
 - `/launch` is a session skeleton and does not start a real desktop capture pipeline.
-- RTP video is driven through the media framework, but the only implemented video source is still a file-backed H.264 simulator.
-- Running without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
+- RTP video is driven through the media framework. Native builds default to live D3D11 NVENC capture; file-backed H.264 is still available with `SUNRISE_VIDEO_SOURCE=annex-b`.
+- Running the file source without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - Windows capture has a DXGI frame source plus smoke/loop tests.
 - H.264 encode smoke can produce Annex B output from captured frames through ffmpeg.
-- Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. RTSP/RTP can opt into this live source with `SUNRISE_VIDEO_SOURCE=native-nvenc`, but it still needs testing on an NVIDIA host.
+- Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. It still needs more testing on NVIDIA headless and virtual-display hosts.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
 - No live video capture-to-RTSP loop or audio capture implementation exists yet.
@@ -197,6 +206,6 @@ This keeps the file-backed H.264 source as a test source while leaving a clean p
 1. Verify the `/launch` and RTSP skeleton against more Moonlight clients.
 2. Gate HTTPS APIs by paired client certificates.
 3. Add GameStream ENet control message parsing and required control replies.
-4. Replace the file-backed `AnnexBVideoSource` with a live encoded source fed by Windows capture plus NVENC.
+4. Harden live capture/NVENC across headless, virtual-display, and multi-adapter systems.
 5. Add real audio capture, Opus encoding, and GameStream audio encryption.
 6. Fill out GameStream control messages and input injection.

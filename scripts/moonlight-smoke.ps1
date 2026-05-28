@@ -388,6 +388,7 @@ finally {
 $daemonJob = Start-Job -ScriptBlock {
     param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source)
     $env:SUNRISE_PAIRING_PIN = $Pin
+    $env:SUNRISE_VIDEO_SOURCE = "annex-b"
     $env:SUNRISE_H264_PATH = $H264Source
     & $ExePath --config $ConfigPath *>&1 | Tee-Object -FilePath $LogPath
 } -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source
