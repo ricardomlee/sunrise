@@ -53,6 +53,11 @@ pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmok
     ffmpeg_impl::run_encode_smoke(options)
 }
 
+#[cfg(all(target_os = "windows", feature = "capture-windows"))]
+pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    ffmpeg_impl::qsv_video_source_from_env()
+}
+
 #[cfg(not(all(target_os = "windows", feature = "capture-windows")))]
 pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmokeReport> {
     let _ = (
@@ -66,6 +71,13 @@ pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmok
     );
     anyhow::bail!(
         "encode-smoke requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows -- encode-smoke"
+    )
+}
+
+#[cfg(not(all(target_os = "windows", feature = "capture-windows")))]
+pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    anyhow::bail!(
+        "QSV video source requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows"
     )
 }
 
@@ -107,9 +119,13 @@ pub(crate) fn native_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource
 #[cfg(all(target_os = "windows", feature = "capture-windows"))]
 mod ffmpeg_impl {
     use std::{
+        collections::VecDeque,
         fs,
-        io::Write,
-        process::{Command, Stdio},
+        io::{Read, Write},
+        path::PathBuf,
+        process::{Child, ChildStdin, Command, Stdio},
+        sync::mpsc::{self, Receiver},
+        thread,
         time::Instant,
     };
 
@@ -117,8 +133,37 @@ mod ffmpeg_impl {
     use tracing::{info, warn};
 
     use crate::capture::WindowsCaptureSource;
+    use crate::media::{EncodedVideoFrame, VideoSource, split_annex_b_access_units};
 
     use super::{EncodeSmokeOptions, EncodeSmokeReport, h264_nal_unit_count};
+
+    pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+        let fps = std::env::var("SUNRISE_VIDEO_FPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let monitor_index = std::env::var("SUNRISE_CAPTURE_MONITOR")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let timeout_ms = std::env::var("SUNRISE_CAPTURE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(33)
+            .max(1);
+        let ffmpeg_path = std::env::var("SUNRISE_FFMPEG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("ffmpeg.exe"));
+
+        Ok(Box::new(FfmpegQsvVideoSource::new(
+            ffmpeg_path,
+            crate::capture::CaptureSourceOptions {
+                monitor_index,
+                timeout_ms,
+            },
+            fps,
+        )?))
+    }
 
     pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmokeReport> {
         if options.encoder.eq_ignore_ascii_case("auto") {
@@ -159,7 +204,7 @@ mod ffmpeg_impl {
         let source_format = first_frame.source_format.clone();
         let frame_count = options.frame_count.max(1);
         let fps = options.fps.max(1);
-        let args = ffmpeg_args(&options, width, height, fps);
+        let args = ffmpeg_file_args(&options, width, height, fps);
 
         info!(
             ffmpeg = %options.ffmpeg_path.display(),
@@ -258,8 +303,229 @@ mod ffmpeg_impl {
         })
     }
 
-    fn ffmpeg_args(options: &EncodeSmokeOptions, width: u32, height: u32, fps: u32) -> Vec<String> {
-        let mut args = vec![
+    struct FfmpegQsvVideoSource {
+        source: WindowsCaptureSource,
+        child: Child,
+        stdin: ChildStdin,
+        frames: Receiver<Vec<u8>>,
+        pending_input: Option<Vec<u8>>,
+        description: String,
+        width: u32,
+        height: u32,
+        frame_interval: std::time::Duration,
+        timestamp_step: u32,
+        frame_index: u32,
+    }
+
+    impl FfmpegQsvVideoSource {
+        fn new(
+            ffmpeg_path: PathBuf,
+            source_options: crate::capture::CaptureSourceOptions,
+            fps: u32,
+        ) -> Result<Self> {
+            let mut source = WindowsCaptureSource::new(source_options)?;
+            let first_frame = source.next_frame()?;
+            let width = first_frame.width;
+            let height = first_frame.height;
+            let source_format = first_frame.source_format.clone();
+            let fps = fps.max(1);
+            let args = ffmpeg_pipe_args(width, height, fps);
+
+            info!(
+                ffmpeg = %ffmpeg_path.display(),
+                width,
+                height,
+                fps,
+                source_format = %source_format,
+                "starting live QSV H.264 encoder"
+            );
+
+            let mut child = Command::new(&ffmpeg_path)
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| {
+                    format!(
+                        "failed to start ffmpeg at {}; install ffmpeg.exe or set SUNRISE_FFMPEG",
+                        ffmpeg_path.display()
+                    )
+                })?;
+            let stdin = child.stdin.take().context("failed to open ffmpeg stdin")?;
+            let stdout = child
+                .stdout
+                .take()
+                .context("failed to open ffmpeg stdout")?;
+            let (tx, rx) = mpsc::sync_channel(16);
+            thread::spawn(move || read_annex_b_frames(stdout, tx));
+
+            Ok(Self {
+                source,
+                child,
+                stdin,
+                frames: rx,
+                pending_input: Some(first_frame.bgra),
+                description: format!(
+                    "FFmpeg QSV live capture {width}x{height} {source_format} -> h264_qsv"
+                ),
+                width,
+                height,
+                frame_interval: std::time::Duration::from_millis(u64::from(1000 / fps)),
+                timestamp_step: 90_000 / fps,
+                frame_index: 1,
+            })
+        }
+
+        fn write_next_input_frame(&mut self) -> Result<()> {
+            let pixels = match self.pending_input.take() {
+                Some(pixels) => pixels,
+                None => {
+                    let frame = self.source.next_frame()?;
+                    if frame.width != self.width || frame.height != self.height {
+                        bail!(
+                            "capture frame size changed from {}x{} to {}x{}",
+                            self.width,
+                            self.height,
+                            frame.width,
+                            frame.height
+                        );
+                    }
+                    frame.bgra
+                }
+            };
+
+            self.stdin
+                .write_all(&pixels)
+                .context("failed to write captured frame to QSV ffmpeg")?;
+            Ok(())
+        }
+    }
+
+    impl Drop for FfmpegQsvVideoSource {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl VideoSource for FfmpegQsvVideoSource {
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn frame_count_hint(&self) -> Option<usize> {
+            None
+        }
+
+        fn frame_interval(&self) -> std::time::Duration {
+            self.frame_interval
+        }
+
+        fn next_frame(&mut self) -> Result<EncodedVideoFrame> {
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                self.write_next_input_frame()?;
+                let now = Instant::now();
+                if now >= deadline {
+                    bail!("timed out waiting for QSV encoder output");
+                }
+                let wait = self.frame_interval.min(deadline - now);
+                match self.frames.recv_timeout(wait) {
+                    Ok(data) => {
+                        let frame_index = self.frame_index;
+                        let timestamp_90khz = frame_index.saturating_mul(self.timestamp_step);
+                        self.frame_index = self.frame_index.wrapping_add(1);
+                        return Ok(EncodedVideoFrame {
+                            data,
+                            frame_index,
+                            timestamp_90khz,
+                        });
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("QSV ffmpeg output stream closed")
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_annex_b_frames<R: Read>(mut stdout: R, tx: mpsc::SyncSender<Vec<u8>>) {
+        let mut scratch = [0_u8; 16 * 1024];
+        let mut pending = Vec::new();
+        let mut queued = VecDeque::new();
+        loop {
+            match stdout.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(bytes) => {
+                    pending.extend_from_slice(&scratch[..bytes]);
+                    let frames = split_annex_b_access_units(&pending);
+                    if frames.len() > 1 {
+                        queued.extend(frames[..frames.len() - 1].iter().cloned());
+                        pending = frames.last().cloned().unwrap_or_default();
+                    }
+                    while let Some(frame) = queued.pop_front() {
+                        if tx.send(frame).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        for frame in split_annex_b_access_units(&pending) {
+            if tx.send(frame).is_err() {
+                return;
+            }
+        }
+    }
+
+    fn ffmpeg_file_args(
+        options: &EncodeSmokeOptions,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Vec<String> {
+        let mut args = ffmpeg_input_args(&options.encoder, width, height, fps);
+        append_encoder_args(&mut args, &options.encoder, fps);
+        args.extend([
+            "-vf".to_string(),
+            encoder_filter(&options.encoder).to_string(),
+            "-f".to_string(),
+            "h264".to_string(),
+            options.output_path.display().to_string(),
+        ]);
+        args
+    }
+
+    fn ffmpeg_pipe_args(width: u32, height: u32, fps: u32) -> Vec<String> {
+        let encoder = "h264_qsv";
+        let mut args = ffmpeg_input_args(encoder, width, height, fps);
+        append_encoder_args(&mut args, encoder, fps);
+        args.extend([
+            "-vf".to_string(),
+            encoder_filter(encoder).to_string(),
+            "-f".to_string(),
+            "h264".to_string(),
+            "pipe:1".to_string(),
+        ]);
+        args
+    }
+
+    fn ffmpeg_input_args(encoder: &str, width: u32, height: u32, fps: u32) -> Vec<String> {
+        let mut args = Vec::new();
+        if uses_qsv(encoder) {
+            args.extend([
+                "-init_hw_device".to_string(),
+                "qsv=hw".to_string(),
+                "-filter_hw_device".to_string(),
+                "hw".to_string(),
+            ]);
+        }
+
+        args.extend([
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
             "error".to_string(),
@@ -275,15 +541,6 @@ mod ffmpeg_impl {
             "-i".to_string(),
             "pipe:0".to_string(),
             "-an".to_string(),
-        ];
-
-        append_encoder_args(&mut args, &options.encoder, fps);
-        args.extend([
-            "-vf".to_string(),
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p".to_string(),
-            "-f".to_string(),
-            "h264".to_string(),
-            options.output_path.display().to_string(),
         ]);
         args
     }
@@ -297,7 +554,7 @@ mod ffmpeg_impl {
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::anyhow!(
-                    "failed to write {frame_context} to ffmpeg: {err}; ffmpeg exited with {}; stderr:\n{}\nIf h264_nvenc failed, try --encoder libx264 to validate the capture-to-H264 path without NVENC.",
+                    "failed to write {frame_context} to ffmpeg: {err}; ffmpeg exited with {}; stderr:\n{}\nIf hardware encoding failed, try --encoder libx264 to validate the capture-to-H264 path without hardware acceleration.",
                     output.status,
                     stderr.trim()
                 )
@@ -309,7 +566,7 @@ mod ffmpeg_impl {
     }
 
     fn append_encoder_args(args: &mut Vec<String>, encoder: &str, fps: u32) {
-        args.extend(["-c:v".to_string(), encoder.to_string()]);
+        args.extend(["-c:v".to_string(), ffmpeg_encoder_name(encoder).to_string()]);
         if encoder.eq_ignore_ascii_case("h264_nvenc") {
             args.extend([
                 "-preset".to_string(),
@@ -334,6 +591,37 @@ mod ffmpeg_impl {
                 "-x264-params".to_string(),
                 format!("keyint={fps}:min-keyint={fps}:scenecut=0"),
             ]);
+        } else if uses_qsv(encoder) {
+            args.extend([
+                "-preset".to_string(),
+                "veryfast".to_string(),
+                "-look_ahead".to_string(),
+                "0".to_string(),
+                "-bf".to_string(),
+                "0".to_string(),
+                "-g".to_string(),
+                fps.to_string(),
+            ]);
+        }
+    }
+
+    fn encoder_filter(encoder: &str) -> &'static str {
+        if uses_qsv(encoder) {
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=nv12,hwupload=extra_hw_frames=64"
+        } else {
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+        }
+    }
+
+    fn uses_qsv(encoder: &str) -> bool {
+        encoder.eq_ignore_ascii_case("h264_qsv") || encoder.eq_ignore_ascii_case("qsv")
+    }
+
+    fn ffmpeg_encoder_name(encoder: &str) -> &str {
+        if encoder.eq_ignore_ascii_case("qsv") {
+            "h264_qsv"
+        } else {
+            encoder
         }
     }
 
@@ -356,7 +644,7 @@ mod ffmpeg_impl {
                 fps: 30,
             };
 
-            let args = ffmpeg_args(&options, 1280, 720, 30);
+            let args = ffmpeg_file_args(&options, 1280, 720, 30);
 
             assert!(
                 args.windows(2)
@@ -369,6 +657,41 @@ mod ffmpeg_impl {
             assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
             assert!(args.contains(&"scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p".to_string()));
             assert_eq!(args.last().map(String::as_str), Some("out.h264"));
+        }
+
+        #[test]
+        fn builds_qsv_ffmpeg_rawvideo_args() {
+            let options = EncodeSmokeOptions {
+                source: CaptureSourceOptions {
+                    monitor_index: Some(2),
+                    timeout_ms: 33,
+                },
+                output_path: "qsv.h264".into(),
+                ffmpeg_path: "ffmpeg.exe".into(),
+                encoder: "h264_qsv".to_string(),
+                frame_count: 2,
+                fps: 60,
+            };
+
+            let args = ffmpeg_file_args(&options, 1920, 1080, 60);
+
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-init_hw_device", "qsv=hw"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-filter_hw_device", "hw"])
+            );
+            assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_qsv"]));
+            assert!(
+                args.contains(
+                    &"scale=trunc(iw/2)*2:trunc(ih/2)*2,format=nv12,hwupload=extra_hw_frames=64"
+                        .to_string()
+                )
+            );
+            assert!(args.windows(2).any(|pair| pair == ["-g", "60"]));
+            assert_eq!(args.last().map(String::as_str), Some("qsv.h264"));
         }
     }
 }

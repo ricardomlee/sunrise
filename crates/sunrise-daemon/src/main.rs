@@ -101,6 +101,24 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Command::QsvSmoke(options) = command {
+        let report = encoder::run_encode_smoke(options)?;
+        let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
+        info!(
+            output = %report.output_path.display(),
+            encoder = %report.encoder,
+            width = report.width,
+            height = report.height,
+            frames = report.frames,
+            elapsed_ms = report.elapsed.as_millis(),
+            fps,
+            bytes_written = report.bytes_written,
+            nal_units = report.nal_units,
+            source_format = %report.source_format,
+            "QSV H.264 encode smoke completed"
+        );
+        return Ok(());
+    }
     if let Command::NativeNvencSmoke(options) = command {
         let report = encoder::run_native_nvenc_smoke(options)?;
         let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
@@ -228,6 +246,7 @@ enum Command {
     CaptureLoop(capture::CaptureLoopOptions),
     CaptureList,
     EncodeSmoke(encoder::EncodeSmokeOptions),
+    QsvSmoke(encoder::EncodeSmokeOptions),
     NativeNvencSmoke(encoder::NativeNvencSmokeOptions),
 }
 
@@ -267,6 +286,10 @@ fn parse_command() -> Result<Command> {
         Some("encode-smoke") => {
             args.next();
             parse_encode_smoke(args).map(Command::EncodeSmoke)
+        }
+        Some("qsv-smoke") => {
+            args.next();
+            parse_qsv_smoke(args).map(Command::QsvSmoke)
         }
         Some("native-nvenc-smoke") => {
             args.next();
@@ -456,6 +479,18 @@ where
     })
 }
 
+fn parse_qsv_smoke<I>(args: I) -> Result<encoder::EncodeSmokeOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = parse_encode_smoke(args)?;
+    options.encoder = "h264_qsv".to_string();
+    if options.output_path == PathBuf::from("target/capture-smoke/capture.h264") {
+        options.output_path = PathBuf::from("target/capture-smoke/qsv.h264");
+    }
+    Ok(options)
+}
+
 fn parse_native_nvenc_smoke<I>(args: I) -> Result<encoder::NativeNvencSmokeOptions>
 where
     I: IntoIterator<Item = String>,
@@ -523,7 +558,7 @@ where
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|h264_qsv|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke [--monitor 1] [--frames 120] [--fps 30] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/qsv.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {

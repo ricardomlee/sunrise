@@ -191,7 +191,7 @@ impl AudioPacketizer {
     }
 }
 
-fn split_annex_b_access_units(data: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_annex_b_access_units(data: &[u8]) -> Vec<Vec<u8>> {
     let units = split_annex_b_units(data);
     let mut frames = Vec::new();
     let mut current = Vec::new();

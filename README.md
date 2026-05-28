@@ -107,7 +107,13 @@ To validate the next boundary, capture frames can be encoded to an Annex B H.264
 cargo run -p sunrise-daemon --features capture-windows -- encode-smoke --frames 120 --fps 30 --output target\capture-smoke\capture.h264
 ```
 
-This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the current CPU-side frame boundary. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes. These commands validate frame acquisition and H.264 encoding; the live encoder is not yet wired into RTSP video.
+For Intel integrated graphics, `qsv-smoke` validates the capture-to-H.264 path through FFmpeg's `h264_qsv` encoder:
+
+```powershell
+cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke --frames 120 --fps 30 --output target\capture-smoke\qsv.h264
+```
+
+This supports 8-bit BGRA/RGBA surfaces and converts HDR-style `Rgba16F` desktop frames to SDR BGRA for the current CPU-side frame boundary. The QSV smoke path converts BGRA to NV12 and uploads frames into a QSV hardware device before encoding. It must run in an interactive Windows desktop session. If the capture API returns `Access denied`, rerun from a normal/elevated terminal outside restricted sandboxes.
 
 For the native no-ffmpeg path, `native-nvenc-smoke` captures a DXGI D3D11 texture and registers a D3D11 texture directly with NVENC:
 
@@ -135,6 +141,15 @@ $env:SUNRISE_VIDEO_FPS = "30"
 $env:SUNRISE_CAPTURE_MONITOR = "1"
 $env:SUNRISE_CAPTURE_TIMEOUT_MS = "33"
 ```
+
+For Intel QSV live testing, build with the capture feature and select QSV explicitly:
+
+```powershell
+$env:SUNRISE_VIDEO_SOURCE = "qsv"
+cargo run -p sunrise-daemon --features capture-windows
+```
+
+The current QSV live source is an FFmpeg-backed bridge: Rust captures frames, feeds `h264_qsv`, reads Annex B H.264 from stdout, and reuses the normal RTP packetizer. A later native oneVPL/D3D11 source should remove this subprocess boundary.
 
 On headless systems, run `capture-list` first. If the Parsec VDD output is not the primary monitor, set `SUNRISE_CAPTURE_MONITOR` to that one-based monitor index. If the VDD is exposed through a non-NVIDIA adapter, DXGI capture may still work but zero-copy NVENC may need a later cross-adapter copy path.
 
@@ -194,7 +209,8 @@ This keeps the file-backed H.264 source as an explicit test source while leaving
 - RTP video is driven through the media framework. Native builds default to live D3D11 NVENC capture; file-backed H.264 is still available with `SUNRISE_VIDEO_SOURCE=annex-b`.
 - Running the file source without `SUNRISE_H264_PATH` uses a tiny fallback placeholder and may show a black screen.
 - Windows capture has a DXGI frame source plus smoke/loop tests.
-- H.264 encode smoke can produce Annex B output from captured frames through ffmpeg.
+- H.264 encode smoke can produce Annex B output from captured frames through ffmpeg, including `h264_qsv` for Intel hardware validation.
+- RTSP video can explicitly use an FFmpeg-backed QSV live source with `SUNRISE_VIDEO_SOURCE=qsv`.
 - Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. It still needs more testing on NVIDIA headless and virtual-display hosts.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
 - ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.

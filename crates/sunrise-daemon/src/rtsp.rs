@@ -448,6 +448,10 @@ fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
             info!("selected RTSP video source: native-nvenc live capture");
             encoder::native_nvenc_video_source_from_env()
         }
+        VideoSourceChoice::Qsv => {
+            info!("selected RTSP video source: qsv live capture");
+            encoder::qsv_video_source_from_env()
+        }
         VideoSourceChoice::AnnexB => {
             info!("selected RTSP video source: annex-b file");
             Ok(Box::new(AnnexBVideoSource::from_env()))
@@ -458,6 +462,7 @@ fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VideoSourceChoice {
     NativeNvenc,
+    Qsv,
     AnnexB,
 }
 
@@ -481,15 +486,20 @@ fn select_video_source(
             Ok(VideoSourceChoice::NativeNvenc)
         }
         Some(value)
+            if value.eq_ignore_ascii_case("qsv") || value.eq_ignore_ascii_case("h264_qsv") =>
+        {
+            Ok(VideoSourceChoice::Qsv)
+        }
+        Some(value)
             if value.eq_ignore_ascii_case("annex-b")
                 || value.eq_ignore_ascii_case("file")
                 || value.eq_ignore_ascii_case("h264") =>
         {
             Ok(VideoSourceChoice::AnnexB)
         }
-        Some(value) => {
-            bail!("unsupported SUNRISE_VIDEO_SOURCE={value:?}; expected native-nvenc or annex-b")
-        }
+        Some(value) => bail!(
+            "unsupported SUNRISE_VIDEO_SOURCE={value:?}; expected native-nvenc, qsv, or annex-b"
+        ),
         None if native_nvenc_video_source_available() => Ok(VideoSourceChoice::NativeNvenc),
         None if h264_path.is_some_and(|value| !value.trim().is_empty()) => {
             Ok(VideoSourceChoice::AnnexB)
@@ -661,6 +671,10 @@ mod tests {
         assert_eq!(
             select_video_source(Some("annex-b"), Some("0"), None).unwrap(),
             VideoSourceChoice::AnnexB
+        );
+        assert_eq!(
+            select_video_source(Some("qsv"), None, Some("sample.h264")).unwrap(),
+            VideoSourceChoice::Qsv
         );
     }
 
