@@ -79,6 +79,23 @@ pub(crate) fn run_capture_smoke(options: CaptureSmokeOptions) -> Result<CaptureS
 }
 
 #[cfg(all(target_os = "windows", feature = "capture-windows"))]
+pub(crate) fn run_wgc_smoke(options: CaptureSmokeOptions) -> Result<CaptureSmokeReport> {
+    windows_capture_impl::run_wgc_smoke(options)
+}
+
+#[cfg(not(all(target_os = "windows", feature = "capture-windows")))]
+pub(crate) fn run_wgc_smoke(options: CaptureSmokeOptions) -> Result<CaptureSmokeReport> {
+    let _ = (
+        options.output_path,
+        options.source.monitor_index,
+        options.source.timeout_ms,
+    );
+    anyhow::bail!(
+        "Windows Graphics Capture smoke requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke"
+    )
+}
+
+#[cfg(all(target_os = "windows", feature = "capture-windows"))]
 pub(crate) fn run_capture_loop(options: CaptureLoopOptions) -> Result<CaptureLoopReport> {
     windows_capture_impl::run_capture_loop(options)
 }
@@ -109,13 +126,26 @@ pub(crate) fn run_capture_list() -> Result<()> {
 
 #[cfg(all(target_os = "windows", feature = "capture-windows"))]
 mod windows_capture_impl {
-    use std::{fs, path::Path, thread, time::Instant};
+    use std::{
+        fs,
+        path::Path,
+        sync::mpsc::{self, SyncSender},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use anyhow::{Context, Result, bail};
     use tracing::{info, warn};
     use windows_capture::{
+        capture::{Context as CaptureContext, GraphicsCaptureApiHandler},
         dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat},
+        frame::Frame,
+        graphics_capture_api::InternalCaptureControl,
         monitor::Monitor,
+        settings::{
+            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        },
     };
 
     use super::{
@@ -235,6 +265,91 @@ mod windows_capture_impl {
             elapsed,
             source_format: frame.source_format,
         })
+    }
+
+    pub(crate) fn run_wgc_smoke(options: CaptureSmokeOptions) -> Result<CaptureSmokeReport> {
+        if let Some(parent) = options.output_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create WGC smoke output directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let mut last_error = None;
+        for monitor in candidate_monitors(options.source.monitor_index)? {
+            let info = monitor_info(monitor);
+            info!(
+                monitor_index = info.index,
+                monitor_name = %info.name,
+                device_name = %info.device_name,
+                adapter = %info.device_string,
+                width = info.width,
+                height = info.height,
+                refresh_rate = info.refresh_rate,
+                "probing Windows Graphics Capture monitor"
+            );
+            match capture_one_wgc_frame(monitor, options.source.timeout_ms) {
+                Ok(frame) => {
+                    let bytes_written = write_bgra_bmp(
+                        &options.output_path,
+                        frame.width,
+                        frame.height,
+                        &frame.bgra,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to save WGC smoke frame to {}",
+                            options.output_path.display()
+                        )
+                    })?;
+                    info!(
+                        output = %options.output_path.display(),
+                        monitor_index = info.index,
+                        monitor_name = %info.name,
+                        device_name = %info.device_name,
+                        adapter = %info.device_string,
+                        width = frame.width,
+                        height = frame.height,
+                        stride = frame.stride,
+                        row_pitch = frame.row_pitch,
+                        depth_pitch = frame.depth_pitch,
+                        source_format = %frame.source_format,
+                        bytes_written,
+                        "captured Windows Graphics Capture frame"
+                    );
+
+                    return Ok(CaptureSmokeReport {
+                        output_path: options.output_path,
+                        monitor_index: info.index,
+                        monitor_name: Some(info.name),
+                        width: frame.width,
+                        height: frame.height,
+                        row_pitch: frame.row_pitch,
+                        depth_pitch: frame.depth_pitch,
+                        source_format: frame.source_format,
+                        bytes_written,
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        monitor_index = info.index,
+                        monitor_name = %info.name,
+                        device_name = %info.device_name,
+                        adapter = %info.device_string,
+                        error = %err,
+                        "Windows Graphics Capture rejected monitor"
+                    );
+                    last_error = Some(format!("#{} {}: {err}", info.index, info.device_name));
+                }
+            }
+        }
+
+        bail!(
+            "failed to capture a Windows Graphics Capture frame: {}",
+            last_error.unwrap_or_else(|| "no active monitors found".to_string())
+        )
     }
 
     pub(crate) struct WindowsCaptureSource {
@@ -407,6 +522,121 @@ mod windows_capture_impl {
             height: monitor.height().unwrap_or(0),
             refresh_rate: monitor.refresh_rate().unwrap_or(0),
         }
+    }
+
+    type WgcFrameResult = std::result::Result<CapturedVideoFrame, String>;
+
+    struct WgcSingleFrameCapture {
+        tx: Option<SyncSender<WgcFrameResult>>,
+    }
+
+    impl GraphicsCaptureApiHandler for WgcSingleFrameCapture {
+        type Flags = SyncSender<WgcFrameResult>;
+        type Error = String;
+
+        fn new(ctx: CaptureContext<Self::Flags>) -> std::result::Result<Self, Self::Error> {
+            Ok(Self {
+                tx: Some(ctx.flags),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            capture_control: InternalCaptureControl,
+        ) -> std::result::Result<(), Self::Error> {
+            let result = wgc_frame_to_captured_frame(frame).map_err(|err| err.to_string());
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(result);
+            }
+            capture_control.stop();
+            Ok(())
+        }
+
+        fn on_closed(&mut self) -> std::result::Result<(), Self::Error> {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(Err("Windows Graphics Capture item closed".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    fn capture_one_wgc_frame(monitor: Monitor, timeout_ms: u32) -> Result<CapturedVideoFrame> {
+        let timeout = Duration::from_millis(u64::from(timeout_ms.max(1000)));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let settings = Settings::new(
+            monitor,
+            CursorCaptureSettings::WithoutCursor,
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            tx,
+        );
+        let control = WgcSingleFrameCapture::start_free_threaded(settings)
+            .context("failed to start Windows Graphics Capture")?;
+        let frame = rx
+            .recv_timeout(timeout)
+            .context("timed out waiting for Windows Graphics Capture frame")?
+            .map_err(anyhow::Error::msg);
+        let stop_result = control.stop();
+        if let Err(err) = stop_result {
+            warn!(%err, "failed to stop Windows Graphics Capture cleanly");
+        }
+        frame
+    }
+
+    fn wgc_frame_to_captured_frame(frame: &mut Frame) -> Result<CapturedVideoFrame> {
+        let frame_index = frame
+            .timestamp()
+            .map(|timestamp| timestamp.Duration as u64)
+            .unwrap_or(0);
+        let frame_buffer = frame.buffer().context("failed to map WGC frame")?;
+        let width = frame_buffer.width();
+        let height = frame_buffer.height();
+        let row_pitch = frame_buffer.row_pitch();
+        let depth_pitch = frame_buffer.depth_pitch();
+        let source_format = frame_buffer.color_format();
+        let mut packed_storage = Vec::new();
+        let packed_pixels = frame_buffer.as_nopadding_buffer(&mut packed_storage);
+        let bgra = wgc_pixels_to_bgra8(width, height, source_format, packed_pixels)?;
+
+        Ok(CapturedVideoFrame {
+            width,
+            height,
+            stride: width * 4,
+            row_pitch,
+            depth_pitch,
+            source_format: format!("WGC {source_format:?}"),
+            frame_index,
+            bgra,
+        })
+    }
+
+    fn wgc_pixels_to_bgra8(
+        width: u32,
+        height: u32,
+        format: ColorFormat,
+        pixels: &[u8],
+    ) -> Result<Vec<u8>> {
+        let bytes_per_pixel = match format {
+            ColorFormat::Bgra8 | ColorFormat::Rgba8 => 4,
+            ColorFormat::Rgba16F => 8,
+        };
+        let pixel_len = width as usize * height as usize * bytes_per_pixel;
+        let Some(pixels) = pixels.get(..pixel_len) else {
+            bail!(
+                "WGC buffer is too small: got {} bytes, expected {pixel_len}",
+                pixels.len()
+            );
+        };
+
+        Ok(match format {
+            ColorFormat::Bgra8 => pixels.to_vec(),
+            ColorFormat::Rgba8 => rgba_to_bgra(pixels),
+            ColorFormat::Rgba16F => rgba16f_to_bgra8(pixels),
+        })
     }
 
     fn capture_pixels_to_bgra8(

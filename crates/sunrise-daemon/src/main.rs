@@ -63,6 +63,22 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Command::WgcSmoke(options) = command {
+        let report = capture::run_wgc_smoke(options)?;
+        info!(
+            output = %report.output_path.display(),
+            monitor_index = report.monitor_index,
+            monitor_name = report.monitor_name.as_deref().unwrap_or("unknown"),
+            width = report.width,
+            height = report.height,
+            row_pitch = report.row_pitch,
+            depth_pitch = report.depth_pitch,
+            source_format = %report.source_format,
+            bytes_written = report.bytes_written,
+            "Windows Graphics Capture smoke completed"
+        );
+        return Ok(());
+    }
     if let Command::CaptureLoop(options) = command {
         let report = capture::run_capture_loop(options)?;
         let fps = f64::from(report.frames) / report.elapsed.as_secs_f64().max(0.001);
@@ -243,6 +259,7 @@ fn parse_bind_ip(value: Option<&str>) -> Result<IpAddr> {
 enum Command {
     Serve { config_path: PathBuf },
     CaptureSmoke(capture::CaptureSmokeOptions),
+    WgcSmoke(capture::CaptureSmokeOptions),
     CaptureLoop(capture::CaptureLoopOptions),
     CaptureList,
     EncodeSmoke(encoder::EncodeSmokeOptions),
@@ -271,6 +288,10 @@ fn parse_command() -> Result<Command> {
         Some("capture-smoke") => {
             args.next();
             parse_capture_smoke(args).map(Command::CaptureSmoke)
+        }
+        Some("wgc-smoke") => {
+            args.next();
+            parse_capture_smoke(args).map(Command::WgcSmoke)
         }
         Some("capture-loop") => {
             args.next();
@@ -558,7 +579,7 @@ where
 }
 
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|h264_qsv|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke [--monitor 1] [--frames 120] [--fps 30] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/qsv.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 1000]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|h264_qsv|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke [--monitor 1] [--frames 120] [--fps 30] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/qsv.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {

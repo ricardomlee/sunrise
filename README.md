@@ -95,6 +95,14 @@ cargo run -p sunrise-daemon --features capture-windows -- capture-list
 cargo run -p sunrise-daemon --features capture-windows -- capture-smoke --output target\capture-smoke\frame.bmp
 ```
 
+If DXGI Desktop Duplication rejects a virtual or headless display with `Access denied`, try the Windows Graphics Capture smoke path against the same monitor:
+
+```powershell
+cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke --monitor 17 --output target\capture-smoke\wgc-frame.bmp
+```
+
+This uses the Windows Graphics Capture API instead of DXGI output duplication and is the intended fallback candidate for Parsec VDD and other virtual displays.
+
 The capture source can also run a short continuous loop and report the observed capture throughput:
 
 ```powershell
