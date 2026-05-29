@@ -55,7 +55,12 @@ pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmok
 
 #[cfg(all(target_os = "windows", feature = "capture-windows"))]
 pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
-    ffmpeg_impl::qsv_video_source_from_env()
+    ffmpeg_impl::hardware_video_source_from_env("h264_qsv")
+}
+
+#[cfg(all(target_os = "windows", feature = "capture-windows"))]
+pub(crate) fn ffmpeg_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    ffmpeg_impl::hardware_video_source_from_env("h264_nvenc")
 }
 
 #[cfg(not(all(target_os = "windows", feature = "capture-windows")))]
@@ -78,6 +83,13 @@ pub(crate) fn run_encode_smoke(options: EncodeSmokeOptions) -> Result<EncodeSmok
 pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
     anyhow::bail!(
         "QSV video source requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows"
+    )
+}
+
+#[cfg(not(all(target_os = "windows", feature = "capture-windows")))]
+pub(crate) fn ffmpeg_nvenc_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    anyhow::bail!(
+        "FFmpeg NVENC video source requires Windows and the capture-windows feature; run: cargo run -p sunrise-daemon --features capture-windows"
     )
 }
 
@@ -137,7 +149,9 @@ mod ffmpeg_impl {
 
     use super::{EncodeSmokeOptions, EncodeSmokeReport, h264_nal_unit_count};
 
-    pub(crate) fn qsv_video_source_from_env() -> Result<Box<dyn VideoSource>> {
+    pub(crate) fn hardware_video_source_from_env(
+        encoder: &'static str,
+    ) -> Result<Box<dyn VideoSource>> {
         let fps = std::env::var("SUNRISE_VIDEO_FPS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -155,8 +169,9 @@ mod ffmpeg_impl {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("ffmpeg.exe"));
 
-        Ok(Box::new(FfmpegQsvVideoSource::new(
+        Ok(Box::new(FfmpegHardwareVideoSource::new(
             ffmpeg_path,
+            encoder,
             crate::capture::CaptureSourceOptions {
                 monitor_index,
                 timeout_ms,
@@ -303,7 +318,7 @@ mod ffmpeg_impl {
         })
     }
 
-    struct FfmpegQsvVideoSource {
+    struct FfmpegHardwareVideoSource {
         source: WindowsCaptureSource,
         child: Child,
         stdin: ChildStdin,
@@ -317,9 +332,10 @@ mod ffmpeg_impl {
         frame_index: u32,
     }
 
-    impl FfmpegQsvVideoSource {
+    impl FfmpegHardwareVideoSource {
         fn new(
             ffmpeg_path: PathBuf,
+            encoder: &'static str,
             source_options: crate::capture::CaptureSourceOptions,
             fps: u32,
         ) -> Result<Self> {
@@ -329,15 +345,16 @@ mod ffmpeg_impl {
             let height = first_frame.height;
             let source_format = first_frame.source_format.clone();
             let fps = fps.max(1);
-            let args = ffmpeg_pipe_args(width, height, fps);
+            let args = ffmpeg_pipe_args(encoder, width, height, fps);
 
             info!(
                 ffmpeg = %ffmpeg_path.display(),
+                encoder,
                 width,
                 height,
                 fps,
                 source_format = %source_format,
-                "starting live QSV H.264 encoder"
+                "starting live FFmpeg H.264 hardware encoder"
             );
 
             let mut child = Command::new(&ffmpeg_path)
@@ -367,7 +384,7 @@ mod ffmpeg_impl {
                 frames: rx,
                 pending_input: Some(first_frame.bgra),
                 description: format!(
-                    "FFmpeg QSV live capture {width}x{height} {source_format} -> h264_qsv"
+                    "FFmpeg live capture {width}x{height} {source_format} -> {encoder}"
                 ),
                 width,
                 height,
@@ -402,14 +419,14 @@ mod ffmpeg_impl {
         }
     }
 
-    impl Drop for FfmpegQsvVideoSource {
+    impl Drop for FfmpegHardwareVideoSource {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
     }
 
-    impl VideoSource for FfmpegQsvVideoSource {
+    impl VideoSource for FfmpegHardwareVideoSource {
         fn description(&self) -> &str {
             &self.description
         }
@@ -500,8 +517,7 @@ mod ffmpeg_impl {
         args
     }
 
-    fn ffmpeg_pipe_args(width: u32, height: u32, fps: u32) -> Vec<String> {
-        let encoder = "h264_qsv";
+    fn ffmpeg_pipe_args(encoder: &str, width: u32, height: u32, fps: u32) -> Vec<String> {
         let mut args = ffmpeg_input_args(encoder, width, height, fps);
         append_encoder_args(&mut args, encoder, fps);
         args.extend([

@@ -103,6 +103,12 @@ cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke --monitor 17
 
 This uses the Windows Graphics Capture API instead of DXGI output duplication and is the intended fallback candidate for Parsec VDD and other virtual displays.
 
+Live CPU-frame capture defaults to `SUNRISE_CAPTURE_BACKEND=auto`: sunrise tries DXGI Desktop Duplication first and falls back to Windows Graphics Capture if duplication is rejected. You can force a backend while testing:
+
+```powershell
+$env:SUNRISE_CAPTURE_BACKEND = "wgc"   # or "dxgi" / "auto"
+```
+
 The capture source can also run a short continuous loop and report the observed capture throughput:
 
 ```powershell
@@ -158,6 +164,14 @@ cargo run -p sunrise-daemon --features capture-windows
 ```
 
 The current QSV live source is an FFmpeg-backed bridge: Rust captures frames, feeds `h264_qsv`, reads Annex B H.264 from stdout, and reuses the normal RTP packetizer. A later native oneVPL/D3D11 source should remove this subprocess boundary.
+
+If native D3D11 NVENC cannot use DXGI duplication on a virtual display, `SUNRISE_VIDEO_SOURCE=native-nvenc` will fall back to an FFmpeg `h264_nvenc` live source instead of falling back to a file source. To force the capture side through Windows Graphics Capture:
+
+```powershell
+$env:SUNRISE_VIDEO_SOURCE = "native-nvenc"
+$env:SUNRISE_CAPTURE_BACKEND = "wgc"
+cargo run -p sunrise-daemon --features native-nvenc
+```
 
 On headless systems, run `capture-list` first. If the Parsec VDD output is not the primary monitor, set `SUNRISE_CAPTURE_MONITOR` to that one-based monitor index. If the VDD is exposed through a non-NVIDIA adapter, DXGI capture may still work but zero-copy NVENC may need a later cross-adapter copy path.
 

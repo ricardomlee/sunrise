@@ -446,7 +446,17 @@ fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
     )? {
         VideoSourceChoice::NativeNvenc => {
             info!("selected RTSP video source: native-nvenc live capture");
-            encoder::native_nvenc_video_source_from_env()
+            match encoder::native_nvenc_video_source_from_env() {
+                Ok(source) => Ok(source),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "native D3D11 NVENC source failed; falling back to FFmpeg h264_nvenc capture source"
+                    );
+                    encoder::ffmpeg_nvenc_video_source_from_env()
+                        .context("failed to create FFmpeg h264_nvenc fallback source")
+                }
+            }
         }
         VideoSourceChoice::Qsv => {
             info!("selected RTSP video source: qsv live capture");

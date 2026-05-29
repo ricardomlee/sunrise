@@ -129,7 +129,7 @@ mod windows_capture_impl {
     use std::{
         fs,
         path::Path,
-        sync::mpsc::{self, SyncSender},
+        sync::mpsc::{self, Receiver, SyncSender},
         thread,
         time::{Duration, Instant},
     };
@@ -204,8 +204,8 @@ mod windows_capture_impl {
 
         info!(
             output = %options.output_path.display(),
-            monitor_index = source.monitor_index,
-            monitor_name = source.monitor_name.as_deref().unwrap_or("unknown"),
+            monitor_index = source.monitor_index(),
+            monitor_name = source.monitor_name().unwrap_or("unknown"),
             width = frame.width,
             height = frame.height,
             stride = frame.stride,
@@ -219,8 +219,8 @@ mod windows_capture_impl {
 
         Ok(CaptureSmokeReport {
             output_path: options.output_path,
-            monitor_index: source.monitor_index,
-            monitor_name: source.monitor_name,
+            monitor_index: source.monitor_index(),
+            monitor_name: source.monitor_name().map(str::to_string),
             width: frame.width,
             height: frame.height,
             row_pitch: frame.row_pitch,
@@ -244,8 +244,8 @@ mod windows_capture_impl {
         let frame = last.context("capture loop produced no frames")?;
         let fps = f64::from(frame_count) / elapsed.as_secs_f64().max(0.001);
         info!(
-            monitor_index = source.monitor_index,
-            monitor_name = source.monitor_name.as_deref().unwrap_or("unknown"),
+            monitor_index = source.monitor_index(),
+            monitor_name = source.monitor_name().unwrap_or("unknown"),
             width = frame.width,
             height = frame.height,
             stride = frame.stride,
@@ -257,8 +257,8 @@ mod windows_capture_impl {
         );
 
         Ok(CaptureLoopReport {
-            monitor_index: source.monitor_index,
-            monitor_name: source.monitor_name,
+            monitor_index: source.monitor_index(),
+            monitor_name: source.monitor_name().map(str::to_string),
             width: frame.width,
             height: frame.height,
             frames: frame_count,
@@ -353,6 +353,60 @@ mod windows_capture_impl {
     }
 
     pub(crate) struct WindowsCaptureSource {
+        inner: WindowsCaptureSourceKind,
+    }
+
+    enum WindowsCaptureSourceKind {
+        Dxgi(DxgiCaptureSource),
+        Wgc(WgcCaptureSource),
+    }
+
+    impl WindowsCaptureSource {
+        pub(crate) fn new(options: CaptureSourceOptions) -> Result<Self> {
+            let inner = match capture_backend_from_env()? {
+                CaptureBackend::Dxgi => {
+                    WindowsCaptureSourceKind::Dxgi(DxgiCaptureSource::new(options)?)
+                }
+                CaptureBackend::Wgc => {
+                    WindowsCaptureSourceKind::Wgc(WgcCaptureSource::new(options)?)
+                }
+                CaptureBackend::Auto => match DxgiCaptureSource::new(options.clone()) {
+                    Ok(source) => WindowsCaptureSourceKind::Dxgi(source),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "DXGI capture source failed; falling back to Windows Graphics Capture"
+                        );
+                        WindowsCaptureSourceKind::Wgc(WgcCaptureSource::new(options)?)
+                    }
+                },
+            };
+            Ok(Self { inner })
+        }
+
+        pub(crate) fn monitor_index(&self) -> usize {
+            match &self.inner {
+                WindowsCaptureSourceKind::Dxgi(source) => source.monitor_index,
+                WindowsCaptureSourceKind::Wgc(source) => source.monitor_index,
+            }
+        }
+
+        pub(crate) fn monitor_name(&self) -> Option<&str> {
+            match &self.inner {
+                WindowsCaptureSourceKind::Dxgi(source) => source.monitor_name.as_deref(),
+                WindowsCaptureSourceKind::Wgc(source) => source.monitor_name.as_deref(),
+            }
+        }
+
+        pub(crate) fn next_frame(&mut self) -> Result<CapturedVideoFrame> {
+            match &mut self.inner {
+                WindowsCaptureSourceKind::Dxgi(source) => source.next_frame(),
+                WindowsCaptureSourceKind::Wgc(source) => source.next_frame(),
+            }
+        }
+    }
+
+    struct DxgiCaptureSource {
         duplication: DxgiDuplicationApi,
         monitor_index: usize,
         monitor_name: Option<String>,
@@ -360,8 +414,8 @@ mod windows_capture_impl {
         frame_index: u64,
     }
 
-    impl WindowsCaptureSource {
-        pub(crate) fn new(options: CaptureSourceOptions) -> Result<Self> {
+    impl DxgiCaptureSource {
+        fn new(options: CaptureSourceOptions) -> Result<Self> {
             let selected = create_duplication_source(options.monitor_index)?;
 
             info!(
@@ -383,7 +437,7 @@ mod windows_capture_impl {
             })
         }
 
-        pub(crate) fn next_frame(&mut self) -> Result<CapturedVideoFrame> {
+        fn next_frame(&mut self) -> Result<CapturedVideoFrame> {
             let mut last_error = None;
             for _ in 1..=30 {
                 match self.duplication.acquire_next_frame(self.timeout_ms) {
@@ -421,6 +475,103 @@ mod windows_capture_impl {
             match last_error {
                 Some(err) => Err(err).context("failed to acquire a Windows capture frame"),
                 None => bail!("failed to acquire a Windows capture frame"),
+            }
+        }
+    }
+
+    struct WgcCaptureSource {
+        control: Option<windows_capture::capture::CaptureControl<WgcFrameCapture, String>>,
+        rx: Receiver<WgcFrameResult>,
+        monitor_index: usize,
+        monitor_name: Option<String>,
+        timeout: Duration,
+    }
+
+    impl WgcCaptureSource {
+        fn new(options: CaptureSourceOptions) -> Result<Self> {
+            let mut last_error = None;
+            for monitor in candidate_monitors(options.monitor_index)? {
+                let info = monitor_info(monitor);
+                info!(
+                    monitor_index = info.index,
+                    monitor_name = %info.name,
+                    device_name = %info.device_name,
+                    adapter = %info.device_string,
+                    width = info.width,
+                    height = info.height,
+                    refresh_rate = info.refresh_rate,
+                    "starting Windows Graphics Capture source"
+                );
+                match start_wgc_capture(monitor, false) {
+                    Ok((control, rx)) => {
+                        return Ok(Self {
+                            control: Some(control),
+                            rx,
+                            monitor_index: info.index,
+                            monitor_name: Some(info.name),
+                            timeout: Duration::from_millis(u64::from(options.timeout_ms.max(1000))),
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            monitor_index = info.index,
+                            monitor_name = %info.name,
+                            device_name = %info.device_name,
+                            adapter = %info.device_string,
+                            error = %err,
+                            "Windows Graphics Capture rejected monitor"
+                        );
+                        last_error = Some(format!("#{} {}: {err}", info.index, info.device_name));
+                    }
+                }
+            }
+
+            bail!(
+                "failed to start Windows Graphics Capture for active monitors: {}",
+                last_error.unwrap_or_else(|| "no active monitors found".to_string())
+            )
+        }
+
+        fn next_frame(&mut self) -> Result<CapturedVideoFrame> {
+            self.rx
+                .recv_timeout(self.timeout)
+                .context("timed out waiting for Windows Graphics Capture frame")?
+                .map_err(anyhow::Error::msg)
+        }
+    }
+
+    impl Drop for WgcCaptureSource {
+        fn drop(&mut self) {
+            if let Some(control) = self.control.take() {
+                let _ = control.stop();
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    enum CaptureBackend {
+        Auto,
+        Dxgi,
+        Wgc,
+    }
+
+    fn capture_backend_from_env() -> Result<CaptureBackend> {
+        match std::env::var("SUNRISE_CAPTURE_BACKEND") {
+            Ok(value) => parse_capture_backend(&value),
+            Err(std::env::VarError::NotPresent) => Ok(CaptureBackend::Auto),
+            Err(err) => Err(anyhow::anyhow!(
+                "failed to read SUNRISE_CAPTURE_BACKEND: {err}"
+            )),
+        }
+    }
+
+    fn parse_capture_backend(value: &str) -> Result<CaptureBackend> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(CaptureBackend::Auto),
+            "dxgi" | "duplication" => Ok(CaptureBackend::Dxgi),
+            "wgc" | "graphics-capture" | "windows-graphics-capture" => Ok(CaptureBackend::Wgc),
+            value => {
+                bail!("unsupported SUNRISE_CAPTURE_BACKEND={value:?}; expected auto, dxgi, or wgc")
             }
         }
     }
@@ -526,17 +677,19 @@ mod windows_capture_impl {
 
     type WgcFrameResult = std::result::Result<CapturedVideoFrame, String>;
 
-    struct WgcSingleFrameCapture {
-        tx: Option<SyncSender<WgcFrameResult>>,
+    struct WgcFrameCapture {
+        tx: SyncSender<WgcFrameResult>,
+        stop_after_first: bool,
     }
 
-    impl GraphicsCaptureApiHandler for WgcSingleFrameCapture {
-        type Flags = SyncSender<WgcFrameResult>;
+    impl GraphicsCaptureApiHandler for WgcFrameCapture {
+        type Flags = (SyncSender<WgcFrameResult>, bool);
         type Error = String;
 
         fn new(ctx: CaptureContext<Self::Flags>) -> std::result::Result<Self, Self::Error> {
             Ok(Self {
-                tx: Some(ctx.flags),
+                tx: ctx.flags.0,
+                stop_after_first: ctx.flags.1,
             })
         }
 
@@ -546,36 +699,24 @@ mod windows_capture_impl {
             capture_control: InternalCaptureControl,
         ) -> std::result::Result<(), Self::Error> {
             let result = wgc_frame_to_captured_frame(frame).map_err(|err| err.to_string());
-            if let Some(tx) = self.tx.take() {
-                let _ = tx.send(result);
+            let _ = self.tx.send(result);
+            if self.stop_after_first {
+                capture_control.stop();
             }
-            capture_control.stop();
             Ok(())
         }
 
         fn on_closed(&mut self) -> std::result::Result<(), Self::Error> {
-            if let Some(tx) = self.tx.take() {
-                let _ = tx.send(Err("Windows Graphics Capture item closed".to_string()));
-            }
+            let _ = self
+                .tx
+                .send(Err("Windows Graphics Capture item closed".to_string()));
             Ok(())
         }
     }
 
     fn capture_one_wgc_frame(monitor: Monitor, timeout_ms: u32) -> Result<CapturedVideoFrame> {
         let timeout = Duration::from_millis(u64::from(timeout_ms.max(1000)));
-        let (tx, rx) = mpsc::sync_channel(1);
-        let settings = Settings::new(
-            monitor,
-            CursorCaptureSettings::WithoutCursor,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
-            tx,
-        );
-        let control = WgcSingleFrameCapture::start_free_threaded(settings)
-            .context("failed to start Windows Graphics Capture")?;
+        let (control, rx) = start_wgc_capture(monitor, true)?;
         let frame = rx
             .recv_timeout(timeout)
             .context("timed out waiting for Windows Graphics Capture frame")?
@@ -585,6 +726,29 @@ mod windows_capture_impl {
             warn!(%err, "failed to stop Windows Graphics Capture cleanly");
         }
         frame
+    }
+
+    fn start_wgc_capture(
+        monitor: Monitor,
+        stop_after_first: bool,
+    ) -> Result<(
+        windows_capture::capture::CaptureControl<WgcFrameCapture, String>,
+        Receiver<WgcFrameResult>,
+    )> {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let settings = Settings::new(
+            monitor,
+            CursorCaptureSettings::WithoutCursor,
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            (tx, stop_after_first),
+        );
+        let control = WgcFrameCapture::start_free_threaded(settings)
+            .context("failed to start Windows Graphics Capture")?;
+        Ok((control, rx))
     }
 
     fn wgc_frame_to_captured_frame(frame: &mut Frame) -> Result<CapturedVideoFrame> {
