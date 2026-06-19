@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -189,8 +189,9 @@ impl RtspState {
         session.streams_started = true;
 
         if let Some(socket) = session.video_socket.clone() {
+            let control_events = self.control_crypto.subscribe();
             session.stream_tasks.push(tokio::spawn(async move {
-                if let Err(err) = stream_video_rtp(socket).await {
+                if let Err(err) = stream_video_rtp(socket, control_events).await {
                     warn!(error = %err, "video RTP sender stopped");
                 }
             }));
@@ -424,7 +425,10 @@ fn describe_sdp(source_ip: &str) -> String {
     .join("\r\n")
 }
 
-async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
+async fn stream_video_rtp(
+    socket: Arc<UdpSocket>,
+    mut control_events: broadcast::Receiver<control::ControlEvent>,
+) -> Result<()> {
     let client = wait_for_udp_ping(&socket, "video").await?;
     let mut source = video_source_from_env()?;
     let mut packetizer = VideoPacketizer::new();
@@ -438,6 +442,12 @@ async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
     );
     loop {
         ticker.tick().await;
+        if drain_video_control_events(&mut control_events) {
+            debug!("received IDR request for current video stream");
+            source
+                .request_idr()
+                .context("failed to request an IDR frame from video source")?;
+        }
         let frame = source.next_frame()?;
         for packet in packetizer.packetize(&frame) {
             socket
@@ -446,6 +456,27 @@ async fn stream_video_rtp(socket: Arc<UdpSocket>) -> Result<()> {
                 .context("failed to send video RTP packet")?;
         }
     }
+}
+
+fn drain_video_control_events(rx: &mut broadcast::Receiver<control::ControlEvent>) -> bool {
+    let mut idr_requested = false;
+    loop {
+        match rx.try_recv() {
+            Ok(control::ControlEvent::IdrFrameRequested) => idr_requested = true,
+            Ok(event) => trace_video_control_event(event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                warn!(skipped, "video control event receiver lagged");
+                idr_requested = true;
+            }
+        }
+    }
+    idr_requested
+}
+
+fn trace_video_control_event(event: control::ControlEvent) {
+    debug!(?event, "received non-video-control GameStream event");
 }
 
 fn video_source_from_env() -> Result<Box<dyn VideoSource>> {
@@ -718,5 +749,15 @@ mod tests {
     #[test]
     fn invalid_video_source_is_rejected() {
         assert!(select_video_source(Some("surprise"), None, None).is_err());
+    }
+
+    #[test]
+    fn drains_video_control_events_and_reports_idr_requests() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        tx.send(control::ControlEvent::StartA).unwrap();
+        tx.send(control::ControlEvent::IdrFrameRequested).unwrap();
+
+        assert!(drain_video_control_events(&mut rx));
+        assert!(!drain_video_control_events(&mut rx));
     }
 }

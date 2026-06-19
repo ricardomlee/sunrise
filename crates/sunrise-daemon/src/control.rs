@@ -14,7 +14,7 @@ use aes_gcm::{
 use anyhow::{Context, Result, anyhow};
 use hex::FromHex;
 use rusty_enet::{Event, Host, HostSettings};
-use tokio::{task::JoinHandle, time::interval};
+use tokio::{sync::broadcast, task::JoinHandle, time::interval};
 use tracing::{debug, info, trace, warn};
 
 const CONTROL_CHANNELS: usize = 2;
@@ -23,6 +23,7 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ENCRYPTED_PACKET_TYPE: u16 = 0x0001;
 const GCM_TAG_LEN: usize = 16;
 const CONTROL_DUMP_DIR_ENV: &str = "SUNRISE_CONTROL_DUMP_DIR";
+const CONTROL_EVENT_CAPACITY: usize = 64;
 
 type LegacyAes128Gcm = AesGcm<Aes128, U16>;
 
@@ -32,6 +33,7 @@ type ControlHost = Host<StdUdpSocket>;
 pub(crate) struct ControlCryptoState {
     current_key: Arc<RwLock<Option<ControlSessionKey>>>,
     dump: Option<ControlDump>,
+    event_tx: broadcast::Sender<ControlEvent>,
 }
 
 impl Default for ControlCryptoState {
@@ -39,6 +41,7 @@ impl Default for ControlCryptoState {
         Self {
             current_key: Arc::new(RwLock::new(None)),
             dump: ControlDump::from_env(),
+            event_tx: broadcast::channel(CONTROL_EVENT_CAPACITY).0,
         }
     }
 }
@@ -82,6 +85,16 @@ impl ControlCryptoState {
         };
         if let Err(err) = dump.write_packet(channel_id, data) {
             warn!(error = %err, "failed to write GameStream control packet dump");
+        }
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ControlEvent> {
+        self.event_tx.subscribe()
+    }
+
+    fn emit_event(&self, event: ControlEvent) {
+        if self.event_tx.send(event).is_err() {
+            trace!("dropping GameStream control event because no receivers are active");
         }
     }
 }
@@ -263,7 +276,7 @@ enum ControlMessageType {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum InputDataType {
+pub(crate) enum InputDataType {
     MouseMoveRel,
     MouseMoveAbs,
     MouseButtonDown,
@@ -290,6 +303,16 @@ struct InputDataHeader {
     input_type: InputDataType,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ControlEvent {
+    IdrFrameRequested,
+    StartA,
+    StartB,
+    PeriodicPing,
+    Termination,
+    InputData(InputDataType),
+}
+
 fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
     if let Ok(packet) = parse_encrypted_control_packet(data) {
         let maybe_key = crypto.key();
@@ -303,6 +326,7 @@ fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
                     "decrypted GameStream control packet"
                 );
                 let payload = parse_control_payload(&decrypted.plaintext)?;
+                publish_control_event(&payload, crypto);
                 log_control_payload(&payload);
                 Ok(())
             }) {
@@ -332,6 +356,7 @@ fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
     }
 
     if let Ok(payload) = parse_control_payload(data) {
+        publish_control_event(&payload, crypto);
         log_control_payload(&payload);
         return;
     }
@@ -340,6 +365,26 @@ fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
         len = data.len(),
         "received unrecognized GameStream control packet"
     );
+}
+
+fn publish_control_event(payload: &ControlPayload<'_>, crypto: &ControlCryptoState) {
+    if let Some(event) = control_event_from_payload(payload) {
+        crypto.emit_event(event);
+    }
+}
+
+fn control_event_from_payload(payload: &ControlPayload<'_>) -> Option<ControlEvent> {
+    match payload.message_type {
+        ControlMessageType::IdrFrame => Some(ControlEvent::IdrFrameRequested),
+        ControlMessageType::StartA => Some(ControlEvent::StartA),
+        ControlMessageType::StartB => Some(ControlEvent::StartB),
+        ControlMessageType::PeriodicPing => Some(ControlEvent::PeriodicPing),
+        ControlMessageType::Termination => Some(ControlEvent::Termination),
+        ControlMessageType::InputData => parse_input_data_header(payload.body)
+            .ok()
+            .map(|input| ControlEvent::InputData(input.input_type)),
+        _ => None,
+    }
 }
 
 fn log_control_payload(payload: &ControlPayload<'_>) {
@@ -699,6 +744,45 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(3);
 
+    enum LegacyMode {
+        ControlV2,
+        Iv16,
+    }
+
+    fn encrypted_test_packet(
+        key: &ControlSessionKey,
+        sequence: u32,
+        plaintext: &[u8],
+        mode: LegacyMode,
+    ) -> Vec<u8> {
+        let encrypted = match mode {
+            LegacyMode::ControlV2 => {
+                let cipher = Aes128Gcm::new_from_slice(&key.key).unwrap();
+                let nonce = control_nonce_candidates(sequence)[0].bytes;
+                cipher
+                    .encrypt(Nonce::from_slice(&nonce), plaintext)
+                    .unwrap()
+            }
+            LegacyMode::Iv16 => {
+                let cipher = LegacyAes128Gcm::new_from_slice(&key.key).unwrap();
+                let nonce = legacy_control_nonce_candidates(sequence)[0].bytes;
+                cipher
+                    .encrypt(GenericArray::from_slice(&nonce), plaintext)
+                    .unwrap()
+            }
+        };
+        let tag_start = encrypted.len() - GCM_TAG_LEN;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ENCRYPTED_PACKET_TYPE.to_le_bytes());
+        let declared_len = u16::try_from(4 + GCM_TAG_LEN + tag_start).unwrap();
+        packet.extend_from_slice(&declared_len.to_le_bytes());
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.extend_from_slice(&encrypted[tag_start..]);
+        packet.extend_from_slice(&encrypted[..tag_start]);
+        packet
+    }
+
     #[tokio::test]
     async fn control_host_accepts_enet_connection() {
         let mut server = control_host("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -846,20 +930,7 @@ mod tests {
             0x00, 0x02, // PERIODIC_PING
             0x00, 0x00, // empty body
         ];
-        let cipher = Aes128Gcm::new_from_slice(&key.key).unwrap();
-        let nonce = control_nonce_candidates(9)[0].bytes;
-        let encrypted = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
-            .unwrap();
-        let tag_start = encrypted.len() - GCM_TAG_LEN;
-
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&ENCRYPTED_PACKET_TYPE.to_le_bytes());
-        let declared_len = u16::try_from(4 + GCM_TAG_LEN + tag_start).unwrap();
-        packet.extend_from_slice(&declared_len.to_le_bytes());
-        packet.extend_from_slice(&9_u32.to_le_bytes());
-        packet.extend_from_slice(&encrypted[tag_start..]);
-        packet.extend_from_slice(&encrypted[..tag_start]);
+        let packet = encrypted_test_packet(&key, 9, &plaintext, LegacyMode::ControlV2);
 
         let parsed = parse_encrypted_control_packet(&packet).unwrap();
         let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
@@ -879,20 +950,7 @@ mod tests {
             0x00, 0x02, // PERIODIC_PING
             0x00, 0x00, // empty body
         ];
-        let cipher = LegacyAes128Gcm::new_from_slice(&key.key).unwrap();
-        let nonce = legacy_control_nonce_candidates(9)[0].bytes;
-        let encrypted = cipher
-            .encrypt(GenericArray::from_slice(&nonce), plaintext.as_slice())
-            .unwrap();
-        let tag_start = encrypted.len() - GCM_TAG_LEN;
-
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&ENCRYPTED_PACKET_TYPE.to_le_bytes());
-        let declared_len = u16::try_from(4 + GCM_TAG_LEN + tag_start).unwrap();
-        packet.extend_from_slice(&declared_len.to_le_bytes());
-        packet.extend_from_slice(&9_u32.to_le_bytes());
-        packet.extend_from_slice(&encrypted[tag_start..]);
-        packet.extend_from_slice(&encrypted[..tag_start]);
+        let packet = encrypted_test_packet(&key, 9, &plaintext, LegacyMode::Iv16);
 
         let parsed = parse_encrypted_control_packet(&packet).unwrap();
         let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
@@ -902,6 +960,25 @@ mod tests {
         assert!(payload.body.is_empty());
         assert_eq!(decrypted.nonce, "legacy-byte0-iv16");
         assert_eq!(decrypted.tag_layout, "tag-first");
+    }
+
+    #[test]
+    fn emits_idr_event_from_decrypted_control_packet() {
+        let crypto = ControlCryptoState::default();
+        let mut events = crypto.subscribe();
+        let key =
+            ControlSessionKey::from_launch_query("1", "00112233445566778899AABBCCDDEEFF").unwrap();
+        let packet = encrypted_test_packet(
+            &key,
+            0,
+            &[0x02, 0x03, 0x02, 0x00, 0x00, 0x00],
+            LegacyMode::Iv16,
+        );
+        crypto.set_key(key);
+
+        inspect_control_packet(&packet, &crypto);
+
+        assert_eq!(events.try_recv().unwrap(), ControlEvent::IdrFrameRequested);
     }
 
     #[test]

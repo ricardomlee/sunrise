@@ -25,6 +25,9 @@ pub(crate) trait VideoSource: Send {
     fn frame_count_hint(&self) -> Option<usize>;
     fn frame_interval(&self) -> Duration;
     fn next_frame(&mut self) -> Result<EncodedVideoFrame>;
+    fn request_idr(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct AnnexBVideoSource {
@@ -120,6 +123,11 @@ impl VideoSource for AnnexBVideoSource {
             frame_index,
             timestamp_90khz,
         })
+    }
+
+    fn request_idr(&mut self) -> Result<()> {
+        self.next_index = 0;
+        Ok(())
     }
 }
 
@@ -548,6 +556,18 @@ mod tests {
         assert_eq!(second.timestamp_90khz, 6000);
         assert_eq!(third.data, vec![1]);
         assert_eq!(third.frame_index, 3);
+    }
+
+    #[test]
+    fn annex_b_video_source_rewinds_to_first_frame_on_idr_request() {
+        let mut source =
+            AnnexBVideoSource::from_frames("test".to_string(), vec![vec![1], vec![2]], 30);
+        assert_eq!(source.next_frame().unwrap().data, vec![1]);
+        assert_eq!(source.next_frame().unwrap().data, vec![2]);
+
+        source.request_idr().unwrap();
+
+        assert_eq!(source.next_frame().unwrap().data, vec![1]);
     }
 
     #[test]
