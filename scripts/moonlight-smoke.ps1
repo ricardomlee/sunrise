@@ -3,7 +3,10 @@ param(
     [string]$HostAddress = "127.0.0.1",
     [string]$Pin = "1234",
     [string]$ConfigPath = "$PSScriptRoot\..\target\moonlight-smoke\sunrise.toml",
-    [switch]$SkipPair
+    [switch]$SkipPair,
+    [switch]$ResetConfig,
+    [switch]$RunStream,
+    [int]$StreamSeconds = 15
 )
 
 $ErrorActionPreference = "Stop"
@@ -191,6 +194,56 @@ function Invoke-MoonlightListUntilDesktop {
     }
 }
 
+function Invoke-MoonlightStreamSmoke {
+    param(
+        [string]$StdoutPath,
+        [string]$StderrPath,
+        [int]$DurationSeconds = 15
+    )
+
+    Remove-Item -LiteralPath $StdoutPath, $StderrPath -ErrorAction SilentlyContinue
+
+    $moonlightDir = Split-Path -Parent $MoonlightPath
+    $streamProcess = Start-Process `
+        -FilePath $MoonlightPath `
+        -ArgumentList @("stream", $HostAddress, "Desktop") `
+        -WorkingDirectory $moonlightDir `
+        -RedirectStandardOutput $StdoutPath `
+        -RedirectStandardError $StderrPath `
+        -PassThru
+
+    try {
+        Start-Sleep -Seconds $DurationSeconds
+        $stillRunning = $null -ne (Get-Process -Id $streamProcess.Id -ErrorAction SilentlyContinue)
+        if ($stillRunning) {
+            Stop-Process -Id $streamProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+
+        $streamLog = ""
+        if (Test-Path -LiteralPath $StdoutPath) {
+            $streamLog += Get-Content -Raw -LiteralPath $StdoutPath
+        }
+        if (Test-Path -LiteralPath $StderrPath) {
+            $streamLog += Get-Content -Raw -LiteralPath $StderrPath
+        }
+
+        if ($streamLog -notmatch "Starting RTSP handshake" -or
+            $streamLog -notmatch "Starting video stream" -or
+            $streamLog -notmatch "FFmpeg-based video decoder chosen") {
+            throw "Moonlight stream did not reach video decode within $DurationSeconds seconds. See $StdoutPath and $StderrPath"
+        }
+
+        if ($streamLog -match "Failed to decrypt audio packet") {
+            Write-Warning "Moonlight video decode started, but audio packets failed to decrypt. This is expected until Sunrise implements GameStream audio encryption."
+        }
+
+        Write-Host "Moonlight stream smoke reached video decode."
+    }
+    finally {
+        Stop-Process -Id $streamProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Read-RtspResponse {
     param([System.Net.Sockets.NetworkStream]$Stream)
 
@@ -370,10 +423,15 @@ $logDir = Join-Path $repoRoot "target\moonlight-smoke"
 $daemonLog = Join-Path $logDir "sunrise-daemon.log"
 $pairLog = Join-Path $logDir "moonlight-pair.log"
 $listLog = Join-Path $logDir "moonlight-list.log"
+$streamStdoutLog = Join-Path $logDir "moonlight-stream.out.log"
+$streamStderrLog = Join-Path $logDir "moonlight-stream.err.log"
 $h264Source = Join-Path $logDir "testsrc.h264"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-Remove-Item -LiteralPath $daemonLog, $pairLog, $listLog -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $daemonLog, $pairLog, $listLog, $streamStdoutLog, $streamStderrLog -ErrorAction SilentlyContinue
+if ($ResetConfig) {
+    Remove-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue
+}
 New-SmokeConfig -Path $ConfigPath
 New-SmokeH264Source -Path $h264Source
 
@@ -406,6 +464,9 @@ try {
 
         Invoke-MoonlightListUntilDesktop -LogPath $listLog
         Invoke-LaunchAndRtspSmoke
+        if ($RunStream) {
+            Invoke-MoonlightStreamSmoke -StdoutPath $streamStdoutLog -StderrPath $streamStderrLog -DurationSeconds $StreamSeconds
+        }
     }
     finally {
         Pop-Location

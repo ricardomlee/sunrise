@@ -72,6 +72,14 @@ On Windows with Moonlight installed:
 
 The script builds sunrise, starts the daemon with a test PIN, runs the real Moonlight CLI to pair with `127.0.0.1`, then runs `Moonlight.exe list 127.0.0.1 --csv --verbose` and checks that `Desktop` is returned. It also probes `/launch`, sends RTSP `OPTIONS`, `DESCRIBE`, `SETUP`, and `PLAY` requests using Moonlight-compatible close-after-response TCP transactions, sends UDP pings, and verifies that video/audio RTP packets are returned.
 
+To reset the smoke-only config and run a real Moonlight stream long enough to verify video decode:
+
+```powershell
+.\scripts\moonlight-smoke.ps1 -ResetConfig -RunStream -StreamSeconds 12
+```
+
+The stream smoke currently treats Moonlight audio decrypt warnings as a known limitation because Sunrise still sends synthetic unencrypted Opus packets.
+
 The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
 
 The smoke test uses local `ffmpeg.exe` to generate `target\moonlight-smoke\testsrc.h264`. To use your own Annex B H.264 elementary stream when running the daemon manually:
