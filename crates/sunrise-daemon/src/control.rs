@@ -6,13 +6,13 @@ use std::{
 
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
 use anyhow::{Context, Result, anyhow};
 use hex::FromHex;
 use rusty_enet::{Event, Host, HostSettings};
 use tokio::{task::JoinHandle, time::interval};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const CONTROL_CHANNELS: usize = 2;
 const CONTROL_PEERS: usize = 8;
@@ -58,14 +58,14 @@ impl ControlCryptoState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ControlSessionKey {
-    pub(crate) key_id: u32,
+    pub(crate) key_id: i32,
     key: [u8; 16],
 }
 
 impl ControlSessionKey {
     pub(crate) fn from_launch_query(rikeyid: &str, rikey: &str) -> Result<Self> {
         let key_id = rikeyid
-            .parse::<u32>()
+            .parse::<i32>()
             .with_context(|| format!("invalid rikeyid {rikeyid:?}"))?;
         let key = <[u8; 16]>::from_hex(rikey).context("rikey must be a 16-byte hex AES-128 key")?;
         Ok(Self { key_id, key })
@@ -151,6 +151,8 @@ struct EncryptedControlPacket<'a> {
     sequence: u32,
     tag: &'a [u8],
     payload: &'a [u8],
+    header: &'a [u8],
+    encrypted_body: &'a [u8],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -211,36 +213,40 @@ fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
     if let Ok(packet) = parse_encrypted_control_packet(data) {
         let maybe_key = crypto.key();
         if let Some(key) = maybe_key.as_ref() {
-            match decrypt_control_packet(key, &packet).and_then(|plain| {
-                let payload = parse_control_payload(&plain)?;
+            match decrypt_control_packet(key, &packet).and_then(|decrypted| {
+                debug!(
+                    key_id = key.key_id,
+                    sequence = packet.sequence,
+                    nonce = decrypted.nonce,
+                    tag_layout = decrypted.tag_layout,
+                    "decrypted GameStream control packet"
+                );
+                let payload = parse_control_payload(&decrypted.plaintext)?;
                 log_control_payload(&payload);
                 Ok(())
             }) {
-                Ok(()) => {
-                    debug!(
-                        key_id = key.key_id,
-                        sequence = packet.sequence,
-                        "decrypted GameStream control packet"
-                    );
-                    return;
-                }
+                Ok(()) => return,
                 Err(err) => {
-                    debug!(
-                        key_id = key.key_id,
-                        sequence = packet.sequence,
-                        error = %err,
-                        "failed to decrypt GameStream control packet"
-                    );
+                    if should_log_control_packet(packet.sequence) {
+                        debug!(
+                            key_id = key.key_id,
+                            sequence = packet.sequence,
+                            error = %err,
+                            "failed to decrypt GameStream control packet"
+                        );
+                    }
                 }
             }
         }
-        debug!(
-            sequence = packet.sequence,
-            payload_len = packet.payload.len(),
-            tag_len = packet.tag.len(),
-            has_key = maybe_key.is_some(),
-            "received encrypted GameStream control packet"
-        );
+        if should_log_control_packet(packet.sequence) {
+            debug!(
+                sequence = packet.sequence,
+                payload_len = packet.payload.len(),
+                tag_len = packet.tag.len(),
+                has_key = maybe_key.is_some(),
+                "received encrypted GameStream control packet"
+            );
+        }
         return;
     }
 
@@ -249,7 +255,7 @@ fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
         return;
     }
 
-    debug!(
+    trace!(
         len = data.len(),
         "received unrecognized GameStream control packet"
     );
@@ -285,24 +291,124 @@ fn log_control_payload(payload: &ControlPayload<'_>) {
     }
 }
 
+struct DecryptedControlPacket {
+    plaintext: Vec<u8>,
+    nonce: &'static str,
+    tag_layout: &'static str,
+}
+
 fn decrypt_control_packet(
     key: &ControlSessionKey,
     packet: &EncryptedControlPacket<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptedControlPacket> {
     let cipher = Aes128Gcm::new_from_slice(&key.key).context("invalid AES-128 control key")?;
-    let nonce = control_nonce(packet.sequence);
-    let mut ciphertext = Vec::with_capacity(packet.payload.len() + packet.tag.len());
-    ciphertext.extend_from_slice(packet.payload);
-    ciphertext.extend_from_slice(packet.tag);
-    cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|err| anyhow!("AES-GCM control decrypt failed: {err}"))
+    let layouts = encrypted_control_layouts(packet);
+    let nonces = control_nonce_candidates(packet.sequence);
+
+    for layout in layouts {
+        for nonce in nonces {
+            let payload = Payload {
+                msg: layout.ciphertext_and_tag.as_slice(),
+                aad: &[],
+            };
+            if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&nonce.bytes), payload) {
+                return Ok(DecryptedControlPacket {
+                    plaintext,
+                    nonce: nonce.name,
+                    tag_layout: layout.name,
+                });
+            }
+
+            let payload = Payload {
+                msg: layout.ciphertext_and_tag.as_slice(),
+                aad: layout.aad,
+            };
+            if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&nonce.bytes), payload) {
+                return Ok(DecryptedControlPacket {
+                    plaintext,
+                    nonce: nonce.name,
+                    tag_layout: layout.name_with_aad,
+                });
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "AES-GCM control decrypt failed for supported nonce/tag layouts"
+    ))
 }
 
-fn control_nonce(sequence: u32) -> [u8; 12] {
-    let mut nonce = [0_u8; 12];
-    nonce[..4].copy_from_slice(&sequence.to_le_bytes());
-    nonce
+struct EncryptedLayout<'a> {
+    name: &'static str,
+    name_with_aad: &'static str,
+    ciphertext_and_tag: Vec<u8>,
+    aad: &'a [u8],
+}
+
+fn encrypted_control_layouts<'a>(
+    packet: &'a EncryptedControlPacket<'a>,
+) -> Vec<EncryptedLayout<'a>> {
+    let mut tag_first = Vec::with_capacity(packet.payload.len() + packet.tag.len());
+    tag_first.extend_from_slice(packet.payload);
+    tag_first.extend_from_slice(packet.tag);
+
+    vec![
+        EncryptedLayout {
+            name: "tag-first",
+            name_with_aad: "tag-first+header-aad",
+            ciphertext_and_tag: tag_first,
+            aad: packet.header,
+        },
+        EncryptedLayout {
+            name: "tag-last",
+            name_with_aad: "tag-last+header-aad",
+            ciphertext_and_tag: packet.encrypted_body.to_vec(),
+            aad: packet.header,
+        },
+    ]
+}
+
+#[derive(Copy, Clone)]
+struct NonceCandidate {
+    name: &'static str,
+    bytes: [u8; 12],
+}
+
+fn control_nonce_candidates(sequence: u32) -> [NonceCandidate; 4] {
+    let mut le_prefix = [0_u8; 12];
+    le_prefix[..4].copy_from_slice(&sequence.to_le_bytes());
+
+    let mut be_prefix = [0_u8; 12];
+    be_prefix[..4].copy_from_slice(&sequence.to_be_bytes());
+
+    let mut le_suffix = [0_u8; 12];
+    le_suffix[8..].copy_from_slice(&sequence.to_le_bytes());
+
+    let mut be_suffix = [0_u8; 12];
+    be_suffix[8..].copy_from_slice(&sequence.to_be_bytes());
+
+    [
+        NonceCandidate {
+            name: "seq-le-prefix",
+            bytes: le_prefix,
+        },
+        NonceCandidate {
+            name: "seq-be-prefix",
+            bytes: be_prefix,
+        },
+        NonceCandidate {
+            name: "seq-le-suffix",
+            bytes: le_suffix,
+        },
+        NonceCandidate {
+            name: "seq-be-suffix",
+            bytes: be_suffix,
+        },
+    ]
+}
+
+fn should_log_control_packet(sequence: u32) -> bool {
+    sequence < 3 || sequence.is_multiple_of(300)
 }
 
 fn parse_encrypted_control_packet(data: &[u8]) -> Result<EncryptedControlPacket<'_>> {
@@ -330,6 +436,8 @@ fn parse_encrypted_control_packet(data: &[u8]) -> Result<EncryptedControlPacket<
         sequence,
         tag: &data[tag_start..payload_start],
         payload: &data[payload_start..],
+        header: &data[..tag_start],
+        encrypted_body: &data[tag_start..],
     })
 }
 
@@ -561,6 +669,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_signed_control_session_key_id_from_launch_query() {
+        let key =
+            ControlSessionKey::from_launch_query("-1653680226", "00112233445566778899AABBCCDDEEFF")
+                .unwrap();
+
+        assert_eq!(key.key_id, -1653680226);
+    }
+
+    #[test]
     fn decrypts_encrypted_control_packet_with_stored_key() {
         let key =
             ControlSessionKey::from_launch_query("1", "00112233445566778899AABBCCDDEEFF").unwrap();
@@ -569,7 +686,7 @@ mod tests {
             0x00, 0x00, // empty body
         ];
         let cipher = Aes128Gcm::new_from_slice(&key.key).unwrap();
-        let nonce = control_nonce(9);
+        let nonce = control_nonce_candidates(9)[0].bytes;
         let encrypted = cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
             .unwrap();
@@ -585,9 +702,11 @@ mod tests {
 
         let parsed = parse_encrypted_control_packet(&packet).unwrap();
         let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
-        let payload = parse_control_payload(&decrypted).unwrap();
+        let payload = parse_control_payload(&decrypted.plaintext).unwrap();
 
         assert_eq!(payload.message_type, ControlMessageType::PeriodicPing);
         assert!(payload.body.is_empty());
+        assert_eq!(decrypted.nonce, "seq-le-prefix");
+        assert_eq!(decrypted.tag_layout, "tag-first");
     }
 }
