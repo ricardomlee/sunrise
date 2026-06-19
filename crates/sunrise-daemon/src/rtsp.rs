@@ -31,6 +31,7 @@ const CONTROL_PORT: u16 = 47999;
 pub struct RtspState {
     inner: Arc<Mutex<RtspSessionState>>,
     bind_ip: IpAddr,
+    control_crypto: control::ControlCryptoState,
 }
 
 impl RtspState {
@@ -38,7 +39,16 @@ impl RtspState {
         Self {
             inner: Arc::new(Mutex::new(RtspSessionState::default())),
             bind_ip,
+            control_crypto: control::ControlCryptoState::default(),
         }
+    }
+
+    pub(crate) fn set_control_key(&self, key: control::ControlSessionKey) {
+        self.control_crypto.set_key(key);
+    }
+
+    pub(crate) fn clear_control_key(&self) {
+        self.control_crypto.clear_key();
     }
 }
 
@@ -159,8 +169,11 @@ impl RtspState {
                 info!(port = AUDIO_PORT, "audio RTP UDP port ready");
             }
             MediaKind::Control if session.control_task.is_none() => {
-                session.control_task =
-                    Some(control::spawn_control_server(self.bind_ip, CONTROL_PORT)?);
+                session.control_task = Some(control::spawn_control_server(
+                    self.bind_ip,
+                    CONTROL_PORT,
+                    self.control_crypto.clone(),
+                )?);
                 info!(port = CONTROL_PORT, "ENet control UDP port ready");
             }
             _ => {}
@@ -203,6 +216,7 @@ impl RtspState {
         if let Some(task) = session.control_task.take() {
             task.abort();
         }
+        self.control_crypto.clear_key();
     }
 }
 

@@ -10,7 +10,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::{AppState, identity::ServerIdentity};
+use crate::{AppState, control::ControlSessionKey, identity::ServerIdentity};
 
 pub async fn serve_https(
     addr: SocketAddr,
@@ -96,11 +96,13 @@ async fn handle_tls_connection(
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
         *state.current_game.lock().await = app_id;
+        store_control_session_key(query, &state);
         let rtsp_url = rtsp_session_url(remote, &state).await;
         info!(app_id, %rtsp_url, route = %path, "launch/resume requested");
         ("200 OK", launch_xml(&rtsp_url))
     } else if method == "GET" && path == "/cancel" {
         *state.current_game.lock().await = 0;
+        state.rtsp.clear_control_key();
         info!("cancel requested");
         ("200 OK", cancel_xml())
     } else if method == "GET" && path == "/pair" && query.contains("phrase=pairchallenge") {
@@ -136,6 +138,18 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (name, value) = pair.split_once('=')?;
         (name == key).then_some(value)
     })
+}
+
+fn store_control_session_key(query: &str, state: &AppState) {
+    match (query_value(query, "rikeyid"), query_value(query, "rikey")) {
+        (Some(rikeyid), Some(rikey)) => {
+            match ControlSessionKey::from_launch_query(rikeyid, rikey) {
+                Ok(key) => state.rtsp.set_control_key(key),
+                Err(err) => warn!(error = %err, "failed to parse launch control RI key"),
+            }
+        }
+        _ => warn!("launch request did not include rikey/rikeyid; control decrypt disabled"),
+    }
 }
 
 async fn rtsp_session_url(remote: SocketAddr, state: &AppState) -> String {

@@ -1,9 +1,15 @@
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
+use aes_gcm::{
+    Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use anyhow::{Context, Result, anyhow};
+use hex::FromHex;
 use rusty_enet::{Event, Host, HostSettings};
 use tokio::{task::JoinHandle, time::interval};
 use tracing::{debug, info, warn};
@@ -15,12 +21,67 @@ const ENCRYPTED_PACKET_TYPE: u16 = 0x0001;
 const GCM_TAG_LEN: usize = 16;
 
 type ControlHost = Host<StdUdpSocket>;
-pub(crate) fn spawn_control_server(bind_ip: IpAddr, port: u16) -> Result<JoinHandle<()>> {
+
+#[derive(Clone, Default)]
+pub(crate) struct ControlCryptoState {
+    current_key: Arc<RwLock<Option<ControlSessionKey>>>,
+}
+
+impl ControlCryptoState {
+    pub(crate) fn set_key(&self, key: ControlSessionKey) {
+        let key_id = key.key_id;
+        *self
+            .current_key
+            .write()
+            .expect("control crypto lock poisoned") = Some(key);
+        info!(
+            key_id,
+            "stored GameStream control RI key for launched session"
+        );
+    }
+
+    pub(crate) fn clear_key(&self) {
+        *self
+            .current_key
+            .write()
+            .expect("control crypto lock poisoned") = None;
+        info!("cleared GameStream control RI key");
+    }
+
+    fn key(&self) -> Option<ControlSessionKey> {
+        self.current_key
+            .read()
+            .expect("control crypto lock poisoned")
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControlSessionKey {
+    pub(crate) key_id: u32,
+    key: [u8; 16],
+}
+
+impl ControlSessionKey {
+    pub(crate) fn from_launch_query(rikeyid: &str, rikey: &str) -> Result<Self> {
+        let key_id = rikeyid
+            .parse::<u32>()
+            .with_context(|| format!("invalid rikeyid {rikeyid:?}"))?;
+        let key = <[u8; 16]>::from_hex(rikey).context("rikey must be a 16-byte hex AES-128 key")?;
+        Ok(Self { key_id, key })
+    }
+}
+
+pub(crate) fn spawn_control_server(
+    bind_ip: IpAddr,
+    port: u16,
+    crypto: ControlCryptoState,
+) -> Result<JoinHandle<()>> {
     let addr = SocketAddr::new(bind_ip, port);
     let host = control_host(addr)?;
 
     Ok(tokio::spawn(async move {
-        if let Err(err) = run_control_server(host).await {
+        if let Err(err) = run_control_server(host, crypto).await {
             warn!(%err, "ENet control server stopped with error");
         }
     }))
@@ -40,7 +101,7 @@ fn control_host(addr: SocketAddr) -> Result<ControlHost> {
     .map_err(|err| anyhow!("failed to initialize ENet control host on {addr}: {err:?}"))
 }
 
-async fn run_control_server(mut host: ControlHost) -> Result<()> {
+async fn run_control_server(mut host: ControlHost, crypto: ControlCryptoState) -> Result<()> {
     let addr = host
         .socket()
         .local_addr()
@@ -51,13 +112,13 @@ async fn run_control_server(mut host: ControlHost) -> Result<()> {
     loop {
         ticker.tick().await;
         while let Some(event) = host.service()? {
-            handle_control_event(event)?;
+            handle_control_event(event, &crypto)?;
         }
         host.flush();
     }
 }
 
-fn handle_control_event(event: Event<StdUdpSocket>) -> Result<()> {
+fn handle_control_event(event: Event<StdUdpSocket>, crypto: &ControlCryptoState) -> Result<()> {
     match event {
         Event::Connect { peer, data } => {
             let peer_id = peer.id();
@@ -73,7 +134,7 @@ fn handle_control_event(event: Event<StdUdpSocket>) -> Result<()> {
             packet,
         } => {
             let peer_id = peer.id();
-            inspect_control_packet(packet.data());
+            inspect_control_packet(packet.data(), crypto);
             debug!(
                 ?peer_id,
                 channel_id,
@@ -146,12 +207,38 @@ struct InputDataHeader {
     input_type: InputDataType,
 }
 
-fn inspect_control_packet(data: &[u8]) {
+fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
     if let Ok(packet) = parse_encrypted_control_packet(data) {
+        let maybe_key = crypto.key();
+        if let Some(key) = maybe_key.as_ref() {
+            match decrypt_control_packet(key, &packet).and_then(|plain| {
+                let payload = parse_control_payload(&plain)?;
+                log_control_payload(&payload);
+                Ok(())
+            }) {
+                Ok(()) => {
+                    debug!(
+                        key_id = key.key_id,
+                        sequence = packet.sequence,
+                        "decrypted GameStream control packet"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    debug!(
+                        key_id = key.key_id,
+                        sequence = packet.sequence,
+                        error = %err,
+                        "failed to decrypt GameStream control packet"
+                    );
+                }
+            }
+        }
         debug!(
             sequence = packet.sequence,
             payload_len = packet.payload.len(),
             tag_len = packet.tag.len(),
+            has_key = maybe_key.is_some(),
             "received encrypted GameStream control packet"
         );
         return;
@@ -196,6 +283,26 @@ fn log_control_payload(payload: &ControlPayload<'_>) {
             "received decrypted GameStream control payload"
         );
     }
+}
+
+fn decrypt_control_packet(
+    key: &ControlSessionKey,
+    packet: &EncryptedControlPacket<'_>,
+) -> Result<Vec<u8>> {
+    let cipher = Aes128Gcm::new_from_slice(&key.key).context("invalid AES-128 control key")?;
+    let nonce = control_nonce(packet.sequence);
+    let mut ciphertext = Vec::with_capacity(packet.payload.len() + packet.tag.len());
+    ciphertext.extend_from_slice(packet.payload);
+    ciphertext.extend_from_slice(packet.tag);
+    cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|err| anyhow!("AES-GCM control decrypt failed: {err}"))
+}
+
+fn control_nonce(sequence: u32) -> [u8; 12] {
+    let mut nonce = [0_u8; 12];
+    nonce[..4].copy_from_slice(&sequence.to_le_bytes());
+    nonce
 }
 
 fn parse_encrypted_control_packet(data: &[u8]) -> Result<EncryptedControlPacket<'_>> {
@@ -350,7 +457,7 @@ mod tests {
 
         while Instant::now() < deadline {
             while let Some(event) = server.service().unwrap() {
-                handle_control_event(event).unwrap();
+                handle_control_event(event, &ControlCryptoState::default()).unwrap();
                 server_connected = true;
             }
             server.flush();
@@ -436,5 +543,51 @@ mod tests {
             InputDataType::from_wire(0xdead_beef),
             InputDataType::Unknown(0xdead_beef)
         );
+    }
+
+    #[test]
+    fn parses_control_session_key_from_launch_query() {
+        let key =
+            ControlSessionKey::from_launch_query("7", "00112233445566778899AABBCCDDEEFF").unwrap();
+
+        assert_eq!(key.key_id, 7);
+        assert_eq!(
+            key.key,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn decrypts_encrypted_control_packet_with_stored_key() {
+        let key =
+            ControlSessionKey::from_launch_query("1", "00112233445566778899AABBCCDDEEFF").unwrap();
+        let plaintext = [
+            0x00, 0x02, // PERIODIC_PING
+            0x00, 0x00, // empty body
+        ];
+        let cipher = Aes128Gcm::new_from_slice(&key.key).unwrap();
+        let nonce = control_nonce(9);
+        let encrypted = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+            .unwrap();
+        let tag_start = encrypted.len() - GCM_TAG_LEN;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ENCRYPTED_PACKET_TYPE.to_le_bytes());
+        let declared_len = u16::try_from(4 + GCM_TAG_LEN + tag_start).unwrap();
+        packet.extend_from_slice(&declared_len.to_le_bytes());
+        packet.extend_from_slice(&9_u32.to_le_bytes());
+        packet.extend_from_slice(&encrypted[tag_start..]);
+        packet.extend_from_slice(&encrypted[..tag_start]);
+
+        let parsed = parse_encrypted_control_packet(&packet).unwrap();
+        let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
+        let payload = parse_control_payload(&decrypted).unwrap();
+
+        assert_eq!(payload.message_type, ControlMessageType::PeriodicPing);
+        assert!(payload.body.is_empty());
     }
 }

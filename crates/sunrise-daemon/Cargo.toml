@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1"
 aes = "0.8"
+aes-gcm = "0.10"
 axum = "0.8"
 hex = "0.4"
 rand = "0.9"
