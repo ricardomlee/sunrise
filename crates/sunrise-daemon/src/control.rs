@@ -1,12 +1,15 @@
 use std::{
+    fs,
     net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket},
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
+use aes::Aes128;
 use aes_gcm::{
-    Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    Aes128Gcm, AesGcm, Nonce,
+    aead::{Aead, KeyInit, Payload, consts::U16, generic_array::GenericArray},
 };
 use anyhow::{Context, Result, anyhow};
 use hex::FromHex;
@@ -19,17 +22,35 @@ const CONTROL_PEERS: usize = 8;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ENCRYPTED_PACKET_TYPE: u16 = 0x0001;
 const GCM_TAG_LEN: usize = 16;
+const CONTROL_DUMP_DIR_ENV: &str = "SUNRISE_CONTROL_DUMP_DIR";
+
+type LegacyAes128Gcm = AesGcm<Aes128, U16>;
 
 type ControlHost = Host<StdUdpSocket>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ControlCryptoState {
     current_key: Arc<RwLock<Option<ControlSessionKey>>>,
+    dump: Option<ControlDump>,
+}
+
+impl Default for ControlCryptoState {
+    fn default() -> Self {
+        Self {
+            current_key: Arc::new(RwLock::new(None)),
+            dump: ControlDump::from_env(),
+        }
+    }
 }
 
 impl ControlCryptoState {
     pub(crate) fn set_key(&self, key: ControlSessionKey) {
         let key_id = key.key_id;
+        if let Some(dump) = &self.dump {
+            if let Err(err) = dump.write_session(&key) {
+                warn!(error = %err, "failed to write GameStream control dump session metadata");
+            }
+        }
         *self
             .current_key
             .write()
@@ -53,6 +74,65 @@ impl ControlCryptoState {
             .read()
             .expect("control crypto lock poisoned")
             .clone()
+    }
+
+    fn dump_packet(&self, channel_id: u8, data: &[u8]) {
+        let Some(dump) = &self.dump else {
+            return;
+        };
+        if let Err(err) = dump.write_packet(channel_id, data) {
+            warn!(error = %err, "failed to write GameStream control packet dump");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ControlDump {
+    dir: PathBuf,
+    next_index: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl ControlDump {
+    fn from_env() -> Option<Self> {
+        let value = std::env::var(CONTROL_DUMP_DIR_ENV).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let dir = PathBuf::from(value);
+        if let Err(err) = fs::create_dir_all(&dir) {
+            warn!(
+                path = %dir.display(),
+                error = %err,
+                "failed to create GameStream control dump directory"
+            );
+            return None;
+        }
+        info!(path = %dir.display(), "GameStream control packet dumps enabled");
+        Some(Self {
+            dir,
+            next_index: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        })
+    }
+
+    fn write_session(&self, key: &ControlSessionKey) -> Result<()> {
+        let path = self.dir.join("session.txt");
+        let body = format!(
+            "rikeyid={}\nrikey={}\n",
+            key.key_id,
+            hex::encode_upper(key.key)
+        );
+        fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn write_packet(&self, channel_id: u8, data: &[u8]) -> Result<()> {
+        let index = self
+            .next_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .dir
+            .join(format!("control-{index:06}-ch{channel_id}.bin"));
+        fs::write(&path, data).with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -134,6 +214,7 @@ fn handle_control_event(event: Event<StdUdpSocket>, crypto: &ControlCryptoState)
             packet,
         } => {
             let peer_id = peer.id();
+            crypto.dump_packet(channel_id, packet.data());
             inspect_control_packet(packet.data(), crypto);
             debug!(
                 ?peer_id,
@@ -302,10 +383,13 @@ fn decrypt_control_packet(
     packet: &EncryptedControlPacket<'_>,
 ) -> Result<DecryptedControlPacket> {
     let cipher = Aes128Gcm::new_from_slice(&key.key).context("invalid AES-128 control key")?;
+    let legacy_cipher =
+        LegacyAes128Gcm::new_from_slice(&key.key).context("invalid AES-128 control key")?;
     let layouts = encrypted_control_layouts(packet);
     let nonces = control_nonce_candidates(packet.sequence);
+    let legacy_nonces = legacy_control_nonce_candidates(packet.sequence);
 
-    for layout in layouts {
+    for layout in &layouts {
         for nonce in nonces {
             let payload = Payload {
                 msg: layout.ciphertext_and_tag.as_slice(),
@@ -324,6 +408,38 @@ fn decrypt_control_packet(
                 aad: layout.aad,
             };
             if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&nonce.bytes), payload) {
+                return Ok(DecryptedControlPacket {
+                    plaintext,
+                    nonce: nonce.name,
+                    tag_layout: layout.name_with_aad,
+                });
+            }
+        }
+    }
+
+    for layout in &layouts {
+        for nonce in legacy_nonces {
+            let payload = Payload {
+                msg: layout.ciphertext_and_tag.as_slice(),
+                aad: &[],
+            };
+            if let Ok(plaintext) =
+                legacy_cipher.decrypt(GenericArray::from_slice(&nonce.bytes), payload)
+            {
+                return Ok(DecryptedControlPacket {
+                    plaintext,
+                    nonce: nonce.name,
+                    tag_layout: layout.name,
+                });
+            }
+
+            let payload = Payload {
+                msg: layout.ciphertext_and_tag.as_slice(),
+                aad: layout.aad,
+            };
+            if let Ok(plaintext) =
+                legacy_cipher.decrypt(GenericArray::from_slice(&nonce.bytes), payload)
+            {
                 return Ok(DecryptedControlPacket {
                     plaintext,
                     nonce: nonce.name,
@@ -374,7 +490,17 @@ struct NonceCandidate {
     bytes: [u8; 12],
 }
 
-fn control_nonce_candidates(sequence: u32) -> [NonceCandidate; 4] {
+fn control_nonce_candidates(sequence: u32) -> [NonceCandidate; 6] {
+    let mut client_control = [0_u8; 12];
+    client_control[..4].copy_from_slice(&sequence.to_le_bytes());
+    client_control[10] = b'C';
+    client_control[11] = b'C';
+
+    let mut host_control = [0_u8; 12];
+    host_control[..4].copy_from_slice(&sequence.to_le_bytes());
+    host_control[10] = b'H';
+    host_control[11] = b'C';
+
     let mut le_prefix = [0_u8; 12];
     le_prefix[..4].copy_from_slice(&sequence.to_le_bytes());
 
@@ -388,6 +514,14 @@ fn control_nonce_candidates(sequence: u32) -> [NonceCandidate; 4] {
     be_suffix[8..].copy_from_slice(&sequence.to_be_bytes());
 
     [
+        NonceCandidate {
+            name: "client-control-v2",
+            bytes: client_control,
+        },
+        NonceCandidate {
+            name: "host-control-v2",
+            bytes: host_control,
+        },
         NonceCandidate {
             name: "seq-le-prefix",
             bytes: le_prefix,
@@ -403,6 +537,33 @@ fn control_nonce_candidates(sequence: u32) -> [NonceCandidate; 4] {
         NonceCandidate {
             name: "seq-be-suffix",
             bytes: be_suffix,
+        },
+    ]
+}
+
+#[derive(Copy, Clone)]
+struct LegacyNonceCandidate {
+    name: &'static str,
+    bytes: [u8; 16],
+}
+
+fn legacy_control_nonce_candidates(sequence: u32) -> [LegacyNonceCandidate; 2] {
+    // Moonlight's legacy control encryption uses a 16-byte AES-GCM IV with only the low
+    // sequence byte populated. Newer control-v2 uses a 12-byte nonce with stream markers.
+    let mut byte0 = [0_u8; 16];
+    byte0[0] = sequence as u8;
+
+    let mut le_prefix = [0_u8; 16];
+    le_prefix[..4].copy_from_slice(&sequence.to_le_bytes());
+
+    [
+        LegacyNonceCandidate {
+            name: "legacy-byte0-iv16",
+            bytes: byte0,
+        },
+        LegacyNonceCandidate {
+            name: "legacy-le-prefix-iv16",
+            bytes: le_prefix,
         },
     ]
 }
@@ -706,7 +867,69 @@ mod tests {
 
         assert_eq!(payload.message_type, ControlMessageType::PeriodicPing);
         assert!(payload.body.is_empty());
-        assert_eq!(decrypted.nonce, "seq-le-prefix");
+        assert_eq!(decrypted.nonce, "client-control-v2");
         assert_eq!(decrypted.tag_layout, "tag-first");
+    }
+
+    #[test]
+    fn decrypts_legacy_iv16_control_packet_with_stored_key() {
+        let key =
+            ControlSessionKey::from_launch_query("1", "00112233445566778899AABBCCDDEEFF").unwrap();
+        let plaintext = [
+            0x00, 0x02, // PERIODIC_PING
+            0x00, 0x00, // empty body
+        ];
+        let cipher = LegacyAes128Gcm::new_from_slice(&key.key).unwrap();
+        let nonce = legacy_control_nonce_candidates(9)[0].bytes;
+        let encrypted = cipher
+            .encrypt(GenericArray::from_slice(&nonce), plaintext.as_slice())
+            .unwrap();
+        let tag_start = encrypted.len() - GCM_TAG_LEN;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&ENCRYPTED_PACKET_TYPE.to_le_bytes());
+        let declared_len = u16::try_from(4 + GCM_TAG_LEN + tag_start).unwrap();
+        packet.extend_from_slice(&declared_len.to_le_bytes());
+        packet.extend_from_slice(&9_u32.to_le_bytes());
+        packet.extend_from_slice(&encrypted[tag_start..]);
+        packet.extend_from_slice(&encrypted[..tag_start]);
+
+        let parsed = parse_encrypted_control_packet(&packet).unwrap();
+        let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
+        let payload = parse_control_payload(&decrypted.plaintext).unwrap();
+
+        assert_eq!(payload.message_type, ControlMessageType::PeriodicPing);
+        assert!(payload.body.is_empty());
+        assert_eq!(decrypted.nonce, "legacy-byte0-iv16");
+        assert_eq!(decrypted.tag_layout, "tag-first");
+    }
+
+    #[test]
+    #[ignore]
+    fn decrypts_captured_control_dump() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("crate should live below the workspace root")
+            .to_path_buf();
+        let dump_dir = workspace_root.join("target/control-dumps/latest");
+        let session = std::fs::read_to_string(dump_dir.join("session.txt")).unwrap();
+        let rikeyid = session
+            .lines()
+            .find_map(|line| line.strip_prefix("rikeyid="))
+            .unwrap();
+        let rikey = session
+            .lines()
+            .find_map(|line| line.strip_prefix("rikey="))
+            .unwrap();
+        let key = ControlSessionKey::from_launch_query(rikeyid, rikey).unwrap();
+        let packet = std::fs::read(dump_dir.join("control-000000-ch0.bin")).unwrap();
+        let parsed = parse_encrypted_control_packet(&packet).unwrap();
+        let decrypted = decrypt_control_packet(&key, &parsed).unwrap();
+        let payload = parse_control_payload(&decrypted.plaintext).unwrap();
+
+        assert_eq!(decrypted.nonce, "legacy-byte0-iv16");
+        assert_eq!(decrypted.tag_layout, "tag-first");
+        assert!(matches!(payload.message_type, ControlMessageType::IdrFrame));
     }
 }
