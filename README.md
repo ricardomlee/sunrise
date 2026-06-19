@@ -235,15 +235,15 @@ This keeps the file-backed H.264 source as an explicit test source while leaving
 - RTSP video can explicitly use an FFmpeg-backed QSV live source with `SUNRISE_VIDEO_SOURCE=qsv`.
 - Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. It still needs more testing on NVIDIA headless and virtual-display hosts.
 - RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
-- ENet control accepts connections and logs packets, but real AES-GCM GameStream control message handling and input injection are not implemented.
-- No live video capture-to-RTSP loop or audio capture implementation exists yet.
+- ENet control accepts connections and parses encrypted packet envelopes plus decrypted payload headers for diagnostics, but `/launch` session keys, AES-GCM decryption, required control replies, and input injection are not implemented.
+- Live video capture-to-RTSP exists through native NVENC or FFmpeg-backed hardware encoders, but it is still experimental on headless, virtual-display, and multi-adapter systems. Real audio capture is not implemented yet.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
 ## Next Milestones
 
 1. Verify the `/launch` and RTSP skeleton against more Moonlight clients.
 2. Gate HTTPS APIs by paired client certificates.
-3. Add GameStream ENet control message parsing and required control replies.
+3. Add `/launch` session keys, AES-GCM control decryption/encryption, required control replies, and Windows input injection.
 4. Harden live capture/NVENC across headless, virtual-display, and multi-adapter systems.
 5. Add real audio capture, Opus encoding, and GameStream audio encryption.
 6. Fill out GameStream control messages and input injection.
