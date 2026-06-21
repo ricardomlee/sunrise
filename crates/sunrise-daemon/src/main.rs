@@ -152,6 +152,17 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Command::AudioSmoke(options) = command {
+        let report = media::run_audio_smoke(options)?;
+        info!(
+            source = %report.source_description,
+            packets = report.packets,
+            bytes = report.bytes,
+            elapsed_ms = report.elapsed.as_millis(),
+            "Windows audio loopback Opus smoke completed"
+        );
+        return Ok(());
+    }
     let Command::Serve { config_path } = command else {
         unreachable!("capture smoke command returns before daemon startup");
     };
@@ -265,6 +276,7 @@ enum Command {
     EncodeSmoke(encoder::EncodeSmokeOptions),
     QsvSmoke(encoder::EncodeSmokeOptions),
     NativeNvencSmoke(encoder::NativeNvencSmokeOptions),
+    AudioSmoke(media::AudioSmokeOptions),
 }
 
 fn parse_command() -> Result<Command> {
@@ -315,6 +327,10 @@ fn parse_command() -> Result<Command> {
         Some("native-nvenc-smoke") => {
             args.next();
             parse_native_nvenc_smoke(args).map(Command::NativeNvencSmoke)
+        }
+        Some("audio-smoke") => {
+            args.next();
+            parse_audio_smoke(args).map(Command::AudioSmoke)
         }
         _ => Err(anyhow!(usage())),
     }
@@ -578,8 +594,32 @@ where
     })
 }
 
+fn parse_audio_smoke<I>(args: I) -> Result<media::AudioSmokeOptions>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut packet_count = 50_u32;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--packets" => {
+                let Some(value) = args.next() else {
+                    return Err(anyhow!("missing value after --packets"));
+                };
+                packet_count = value
+                    .parse::<u32>()
+                    .context("failed to parse --packets as a packet count")?;
+            }
+            _ => return Err(anyhow!(usage())),
+        }
+    }
+
+    Ok(media::AudioSmokeOptions { packet_count })
+}
+
 fn usage() -> &'static str {
-    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 1000]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|h264_qsv|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke [--monitor 1] [--frames 120] [--fps 30] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/qsv.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
+    "usage: cargo run -p sunrise-daemon -- [--config path/to/sunrise.toml]\n       cargo run -p sunrise-daemon --features audio-windows -- audio-smoke [--packets 50]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-list\n       cargo run -p sunrise-daemon --features capture-windows -- capture-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- wgc-smoke [--monitor 1] [--output target/capture-smoke/frame.bmp] [--timeout-ms 1000]\n       cargo run -p sunrise-daemon --features capture-windows -- capture-loop [--monitor 1] [--frames 120] [--timeout-ms 33]\n       cargo run -p sunrise-daemon --features capture-windows -- encode-smoke [--monitor 1] [--frames 120] [--fps 30] [--encoder auto|h264_nvenc|h264_qsv|libx264] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/capture.h264]\n       cargo run -p sunrise-daemon --features capture-windows -- qsv-smoke [--monitor 1] [--frames 120] [--fps 30] [--ffmpeg ffmpeg.exe] [--output target/capture-smoke/qsv.h264]\n       cargo run -p sunrise-daemon --features native-nvenc -- native-nvenc-smoke [--monitor 1] [--frames 120] [--fps 30] [--output target/capture-smoke/native-nvenc.h264]"
 }
 
 async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
@@ -697,5 +737,13 @@ mod tests {
     #[test]
     fn rejects_empty_bind_ip() {
         assert!(parse_bind_ip(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn parses_audio_smoke_packet_count() {
+        let options = super::parse_audio_smoke(["--packets".to_string(), "7".to_string()])
+            .expect("audio-smoke args should parse");
+
+        assert_eq!(options.packet_count, 7);
     }
 }

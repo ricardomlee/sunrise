@@ -17,6 +17,13 @@ const VIDEO_MAGIC: &[u8; 8] = b"\x017charss";
 const VIDEO_SSRC: u32 = 0x5253_5650;
 const AUDIO_SSRC: u32 = 0x5253_4150;
 const VIDEO_CLOCK_RATE: u32 = 90_000;
+pub(crate) const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub(crate) const AUDIO_CHANNELS: u16 = 2;
+pub(crate) const AUDIO_FRAME_SAMPLES_PER_CHANNEL: usize = 960;
+#[cfg(feature = "audio-windows")]
+const AUDIO_MAX_OPUS_PACKET_BYTES: usize = 1275;
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+const AUDIO_CAPTURE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(crate) struct EncodedVideoFrame {
     pub(crate) data: Vec<u8>,
@@ -164,6 +171,64 @@ pub(crate) struct EncodedAudioPacket {
     pub(crate) timestamp: u32,
 }
 
+pub(crate) struct AudioSmokeOptions {
+    pub(crate) packet_count: u32,
+}
+
+pub(crate) struct AudioSmokeReport {
+    pub(crate) packets: u32,
+    pub(crate) bytes: usize,
+    pub(crate) elapsed: Duration,
+    pub(crate) source_description: String,
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+pub(crate) fn run_audio_smoke(options: AudioSmokeOptions) -> Result<AudioSmokeReport> {
+    let mut source = CapturedOpusSource::new(WasapiLoopbackCapture::new()?, LibOpusEncoder::new()?);
+    let source_description = source.description().to_string();
+    let started = std::time::Instant::now();
+    let mut bytes = 0_usize;
+    for _ in 0..options.packet_count {
+        bytes += source.next_packet()?.payload.len();
+    }
+
+    Ok(AudioSmokeReport {
+        packets: options.packet_count,
+        bytes,
+        elapsed: started.elapsed(),
+        source_description,
+    })
+}
+
+#[cfg(not(all(target_os = "windows", feature = "audio-windows")))]
+pub(crate) fn run_audio_smoke(_options: AudioSmokeOptions) -> Result<AudioSmokeReport> {
+    anyhow::bail!(
+        "audio-smoke requires Windows and the audio-windows feature; run: cargo run -p sunrise-daemon --features audio-windows -- audio-smoke"
+    )
+}
+
+pub(crate) trait AudioSource: Send {
+    fn description(&self) -> &str;
+    fn packet_interval(&self) -> Duration;
+    fn next_packet(&mut self) -> Result<EncodedAudioPacket>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PcmAudioFrame {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+}
+
+pub(crate) trait PcmAudioCapture: Send {
+    fn description(&self) -> &str;
+    fn next_frame(&mut self) -> Result<PcmAudioFrame>;
+}
+
+pub(crate) trait OpusFrameEncoder: Send {
+    fn encode_float(&mut self, samples: &[f32]) -> Result<Vec<u8>>;
+}
+
 pub(crate) struct OpusSilenceSource {
     timestamp: u32,
 }
@@ -172,18 +237,432 @@ impl OpusSilenceSource {
     pub(crate) fn new() -> Self {
         Self { timestamp: 0 }
     }
+}
 
-    pub(crate) fn packet_interval(&self) -> Duration {
+impl AudioSource for OpusSilenceSource {
+    fn description(&self) -> &str {
+        "synthetic Opus silence"
+    }
+
+    fn packet_interval(&self) -> Duration {
         Duration::from_millis(20)
     }
 
-    pub(crate) fn next_packet(&mut self) -> EncodedAudioPacket {
+    fn next_packet(&mut self) -> Result<EncodedAudioPacket> {
         let packet = EncodedAudioPacket {
             payload: vec![0xF8, 0xFF, 0xFE],
             timestamp: self.timestamp,
         };
         self.timestamp = self.timestamp.wrapping_add(960);
-        packet
+        Ok(packet)
+    }
+}
+
+pub(crate) struct CapturedOpusSource<C, E> {
+    capture: C,
+    encoder: E,
+    timestamp: u32,
+    description: String,
+}
+
+impl<C, E> CapturedOpusSource<C, E>
+where
+    C: PcmAudioCapture,
+    E: OpusFrameEncoder,
+{
+    pub(crate) fn new(capture: C, encoder: E) -> Self {
+        let description = format!("{} via Opus", capture.description());
+        Self {
+            capture,
+            encoder,
+            timestamp: 0,
+            description,
+        }
+    }
+}
+
+impl<C, E> AudioSource for CapturedOpusSource<C, E>
+where
+    C: PcmAudioCapture,
+    E: OpusFrameEncoder,
+{
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn packet_interval(&self) -> Duration {
+        Duration::from_millis(20)
+    }
+
+    fn next_packet(&mut self) -> Result<EncodedAudioPacket> {
+        let frame = self.capture.next_frame()?;
+        validate_opus_frame(&frame)?;
+        let payload = self.encoder.encode_float(&frame.samples)?;
+        let packet = EncodedAudioPacket {
+            payload,
+            timestamp: self.timestamp,
+        };
+        self.timestamp = self.timestamp.wrapping_add(960);
+        Ok(packet)
+    }
+}
+
+fn validate_opus_frame(frame: &PcmAudioFrame) -> Result<()> {
+    if frame.sample_rate != AUDIO_SAMPLE_RATE {
+        anyhow::bail!(
+            "captured audio sample rate {} did not match required Opus RTP rate {}",
+            frame.sample_rate,
+            AUDIO_SAMPLE_RATE
+        );
+    }
+    if frame.channels != AUDIO_CHANNELS {
+        anyhow::bail!(
+            "captured audio channel count {} did not match required stereo channel count {}",
+            frame.channels,
+            AUDIO_CHANNELS
+        );
+    }
+    let expected_samples = AUDIO_FRAME_SAMPLES_PER_CHANNEL * usize::from(AUDIO_CHANNELS);
+    if frame.samples.len() != expected_samples {
+        anyhow::bail!(
+            "captured audio frame had {} samples; expected {expected_samples}",
+            frame.samples.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "audio-windows")]
+pub(crate) struct LibOpusEncoder {
+    encoder: *mut libopus_sys::OpusEncoder,
+}
+
+#[cfg(feature = "audio-windows")]
+impl LibOpusEncoder {
+    pub(crate) fn new() -> Result<Self> {
+        let mut error = 0_i32;
+        let encoder = unsafe {
+            libopus_sys::opus_encoder_create(
+                AUDIO_SAMPLE_RATE as i32,
+                i32::from(AUDIO_CHANNELS),
+                libopus_sys::OPUS_APPLICATION_AUDIO as i32,
+                &mut error,
+            )
+        };
+        if encoder.is_null() || error != libopus_sys::OPUS_OK as i32 {
+            anyhow::bail!("failed to create Opus encoder: error code {error}");
+        }
+        Ok(Self { encoder })
+    }
+}
+
+#[cfg(feature = "audio-windows")]
+impl Drop for LibOpusEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            libopus_sys::opus_encoder_destroy(self.encoder);
+        }
+    }
+}
+
+#[cfg(feature = "audio-windows")]
+unsafe impl Send for LibOpusEncoder {}
+
+#[cfg(feature = "audio-windows")]
+impl OpusFrameEncoder for LibOpusEncoder {
+    fn encode_float(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
+        let mut output = vec![0_u8; AUDIO_MAX_OPUS_PACKET_BYTES];
+        let bytes = unsafe {
+            libopus_sys::opus_encode_float(
+                self.encoder,
+                samples.as_ptr(),
+                AUDIO_FRAME_SAMPLES_PER_CHANNEL as i32,
+                output.as_mut_ptr(),
+                output.len() as i32,
+            )
+        };
+        if bytes < 0 {
+            anyhow::bail!("Opus encode failed: error code {bytes}");
+        }
+        output.truncate(bytes as usize);
+        Ok(output)
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+pub(crate) struct WasapiLoopbackCapture {
+    _com: ComApartment,
+    audio_client: windows::Win32::Media::Audio::IAudioClient,
+    capture_client: windows::Win32::Media::Audio::IAudioCaptureClient,
+    format: WasapiSampleFormat,
+    pending: Vec<f32>,
+    description: String,
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl WasapiLoopbackCapture {
+    pub(crate) fn new() -> Result<Self> {
+        use windows::Win32::{
+            Media::Audio::{
+                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
+                IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+            },
+            System::Com::{CLSCTX_ALL, CoCreateInstance},
+        };
+
+        let com = ComApartment::new()?;
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .context("failed to create Windows MMDeviceEnumerator")?;
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+            .context("failed to open default Windows render endpoint")?;
+        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
+            .context("failed to activate default render endpoint audio client")?;
+        let mix_format_ptr = unsafe { audio_client.GetMixFormat() }
+            .context("failed to read default render endpoint mix format")?;
+        let mix_format = unsafe { WasapiMixFormat::from_ptr(mix_format_ptr) };
+        if let Err(err) = mix_format.validate_for_opus_rtp() {
+            unsafe {
+                windows::Win32::System::Com::CoTaskMemFree(Some(mix_format_ptr.cast()));
+            }
+            return Err(err);
+        }
+
+        let buffer_duration_100ns = 200_000_i64;
+        let initialize_result = unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                buffer_duration_100ns,
+                0,
+                mix_format_ptr,
+                None,
+            )
+        };
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(mix_format_ptr.cast()));
+        }
+        initialize_result.context("failed to initialize WASAPI shared loopback capture")?;
+        let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService() }
+            .context("failed to acquire WASAPI capture client")?;
+        unsafe { audio_client.Start() }.context("failed to start WASAPI loopback capture")?;
+
+        Ok(Self {
+            _com: com,
+            audio_client,
+            capture_client,
+            format: mix_format.sample_format,
+            pending: Vec::new(),
+            description: format!(
+                "WASAPI loopback {} Hz {}ch {:?}",
+                mix_format.sample_rate, mix_format.channels, mix_format.sample_format
+            ),
+        })
+    }
+
+    fn read_available_packets(&mut self) -> Result<()> {
+        use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT;
+
+        loop {
+            let packet_frames = unsafe { self.capture_client.GetNextPacketSize() }
+                .context("failed to query WASAPI loopback packet size")?;
+            if packet_frames == 0 {
+                return Ok(());
+            }
+
+            let mut data = std::ptr::null_mut();
+            let mut frames = 0_u32;
+            let mut flags = 0_u32;
+            unsafe {
+                self.capture_client
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+            }
+            .context("failed to read WASAPI loopback packet")?;
+            let result = self.copy_packet(
+                data,
+                frames,
+                flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0,
+            );
+            unsafe { self.capture_client.ReleaseBuffer(frames) }
+                .context("failed to release WASAPI loopback packet")?;
+            result?;
+        }
+    }
+
+    fn copy_packet(&mut self, data: *mut u8, frames: u32, silent: bool) -> Result<()> {
+        let sample_count = frames as usize * usize::from(AUDIO_CHANNELS);
+        if silent || data.is_null() {
+            self.pending.extend(std::iter::repeat_n(0.0, sample_count));
+            return Ok(());
+        }
+
+        match self.format {
+            WasapiSampleFormat::Float32 => {
+                let samples =
+                    unsafe { std::slice::from_raw_parts(data.cast::<f32>(), sample_count) };
+                self.pending.extend(samples.iter().copied());
+            }
+            WasapiSampleFormat::Int16 => {
+                let samples =
+                    unsafe { std::slice::from_raw_parts(data.cast::<i16>(), sample_count) };
+                self.pending
+                    .extend(samples.iter().map(|sample| f32::from(*sample) / 32768.0));
+            }
+            WasapiSampleFormat::Unsupported => {
+                anyhow::bail!("cannot copy unsupported WASAPI sample format")
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl Drop for WasapiLoopbackCapture {
+    fn drop(&mut self) {
+        unsafe {
+            self.audio_client.Stop().ok();
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+unsafe impl Send for WasapiLoopbackCapture {}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl PcmAudioCapture for WasapiLoopbackCapture {
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn next_frame(&mut self) -> Result<PcmAudioFrame> {
+        let expected_samples = AUDIO_FRAME_SAMPLES_PER_CHANNEL * usize::from(AUDIO_CHANNELS);
+        let deadline = std::time::Instant::now() + AUDIO_CAPTURE_WAIT_TIMEOUT;
+        while self.pending.len() < expected_samples && std::time::Instant::now() < deadline {
+            self.read_available_packets()?;
+            if self.pending.len() < expected_samples {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if self.pending.len() < expected_samples {
+            self.pending.resize(expected_samples, 0.0);
+        }
+
+        let samples = self.pending.drain(..expected_samples).collect();
+        Ok(PcmAudioFrame {
+            samples,
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS,
+        })
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+struct ComApartment {
+    uninitialize: bool,
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl ComApartment {
+    fn new() -> Result<Self> {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        hr.ok().context("failed to initialize COM for WASAPI")?;
+        Ok(Self { uninitialize: true })
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.uninitialize {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WasapiSampleFormat {
+    Float32,
+    Int16,
+    Unsupported,
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WasapiMixFormat {
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    block_align: u16,
+    sample_format: WasapiSampleFormat,
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+impl WasapiMixFormat {
+    unsafe fn from_ptr(format: *const windows::Win32::Media::Audio::WAVEFORMATEX) -> Self {
+        use windows::Win32::Media::{
+            Audio::{WAVE_FORMAT_PCM, WAVEFORMATEXTENSIBLE},
+            KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE},
+            Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
+        };
+
+        let tag = unsafe { std::ptr::addr_of!((*format).wFormatTag).read_unaligned() };
+        let sample_rate = unsafe { std::ptr::addr_of!((*format).nSamplesPerSec).read_unaligned() };
+        let channels = unsafe { std::ptr::addr_of!((*format).nChannels).read_unaligned() };
+        let bits_per_sample =
+            unsafe { std::ptr::addr_of!((*format).wBitsPerSample).read_unaligned() };
+        let block_align = unsafe { std::ptr::addr_of!((*format).nBlockAlign).read_unaligned() };
+
+        let sample_format = if u32::from(tag) == WAVE_FORMAT_IEEE_FLOAT {
+            WasapiSampleFormat::Float32
+        } else if u32::from(tag) == WAVE_FORMAT_PCM {
+            WasapiSampleFormat::Int16
+        } else if u32::from(tag) == WAVE_FORMAT_EXTENSIBLE {
+            let extensible = format.cast::<WAVEFORMATEXTENSIBLE>();
+            let sub_format =
+                unsafe { std::ptr::addr_of!((*extensible).SubFormat).read_unaligned() };
+            if sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+                WasapiSampleFormat::Float32
+            } else if sub_format == KSDATAFORMAT_SUBTYPE_PCM {
+                WasapiSampleFormat::Int16
+            } else {
+                WasapiSampleFormat::Unsupported
+            }
+        } else {
+            WasapiSampleFormat::Unsupported
+        };
+
+        Self {
+            sample_rate,
+            channels,
+            bits_per_sample,
+            block_align,
+            sample_format,
+        }
+    }
+
+    fn validate_for_opus_rtp(&self) -> Result<()> {
+        if self.sample_rate != AUDIO_SAMPLE_RATE || self.channels != AUDIO_CHANNELS {
+            anyhow::bail!(
+                "WASAPI mix format is {} Hz {}ch; Sunrise currently requires {} Hz {}ch",
+                self.sample_rate,
+                self.channels,
+                AUDIO_SAMPLE_RATE,
+                AUDIO_CHANNELS
+            );
+        }
+        match (self.sample_format, self.bits_per_sample) {
+            (WasapiSampleFormat::Float32, 32) | (WasapiSampleFormat::Int16, 16) => Ok(()),
+            _ => anyhow::bail!(
+                "unsupported WASAPI mix format {:?}/{} bits; expected float32 or int16",
+                self.sample_format,
+                self.bits_per_sample
+            ),
+        }
     }
 }
 
@@ -674,12 +1153,89 @@ mod tests {
     fn builds_audio_rtp_packet_with_opus_payload_type() {
         let mut source = OpusSilenceSource::new();
         let mut packetizer = AudioPacketizer::new();
-        let packet = packetizer.packetize(&source.next_packet());
+        let packet = packetizer.packetize(&source.next_packet().unwrap());
 
         assert_eq!(&packet[..2], &[0x80, RTP_AUDIO_PAYLOAD_TYPE]);
         assert_eq!(&packet[2..4], &1_u16.to_be_bytes());
         assert_eq!(&packet[4..8], &0_u32.to_be_bytes());
         assert_eq!(&packet[RTP_AUDIO_HEADER_LEN..], &[0xF8, 0xFF, 0xFE]);
+    }
+
+    #[test]
+    fn captured_opus_source_encodes_pcm_frames_and_advances_timestamps() {
+        let mut source = CapturedOpusSource::new(FakePcmCapture::new(), FakeOpusEncoder);
+
+        let first = source.next_packet().unwrap();
+        let second = source.next_packet().unwrap();
+
+        assert_eq!(source.description(), "fake loopback via Opus");
+        assert_eq!(source.packet_interval(), Duration::from_millis(20));
+        assert_eq!(first.timestamp, 0);
+        assert_eq!(first.payload, vec![0xAA, 0x80]);
+        assert_eq!(second.timestamp, 960);
+        assert_eq!(second.payload, vec![0xAA, 0x40]);
+    }
+
+    #[cfg(all(target_os = "windows", feature = "audio-windows"))]
+    #[test]
+    fn wasapi_mix_format_gate_accepts_only_current_opus_rtp_shape() {
+        assert!(
+            WasapiMixFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 32,
+                block_align: 8,
+                sample_format: WasapiSampleFormat::Float32,
+            }
+            .validate_for_opus_rtp()
+            .is_ok()
+        );
+        assert!(
+            WasapiMixFormat {
+                sample_rate: 44_100,
+                channels: 2,
+                bits_per_sample: 32,
+                block_align: 8,
+                sample_format: WasapiSampleFormat::Float32,
+            }
+            .validate_for_opus_rtp()
+            .is_err()
+        );
+    }
+
+    struct FakePcmCapture {
+        next_sample: f32,
+    }
+
+    impl FakePcmCapture {
+        fn new() -> Self {
+            Self { next_sample: 1.0 }
+        }
+    }
+
+    impl PcmAudioCapture for FakePcmCapture {
+        fn description(&self) -> &str {
+            "fake loopback"
+        }
+
+        fn next_frame(&mut self) -> Result<PcmAudioFrame> {
+            let sample = self.next_sample;
+            self.next_sample *= 0.5;
+            Ok(PcmAudioFrame {
+                samples: vec![sample; 960 * 2],
+                sample_rate: 48_000,
+                channels: 2,
+            })
+        }
+    }
+
+    struct FakeOpusEncoder;
+
+    impl OpusFrameEncoder for FakeOpusEncoder {
+        fn encode_float(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
+            let first = (samples[0] * 128.0) as u8;
+            Ok(vec![0xAA, first])
+        }
     }
 
     #[test]

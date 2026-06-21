@@ -6,6 +6,7 @@ param(
     [switch]$SkipPair,
     [switch]$ResetConfig,
     [switch]$RunStream,
+    [switch]$UseWasapiAudio,
     [int]$StreamSeconds = 25
 )
 
@@ -456,20 +457,30 @@ New-SmokeH264Source -Path $h264Source
 
 Push-Location $repoRoot
 try {
-    cargo build -p sunrise-daemon
+    $cargoArgs = @("build", "-p", "sunrise-daemon")
+    if ($UseWasapiAudio) {
+        $cargoArgs += @("--features", "audio-windows")
+    }
+    & cargo @cargoArgs
 }
 finally {
     Pop-Location
 }
 
 $daemonJob = Start-Job -ScriptBlock {
-    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source, $HostAddress)
+    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source, $HostAddress, $UseWasapiAudio)
     $env:SUNRISE_PAIRING_PIN = $Pin
     $env:SUNRISE_BIND_IP = $HostAddress
     $env:SUNRISE_VIDEO_SOURCE = "annex-b"
+    if ([string]::IsNullOrWhiteSpace($env:RUST_LOG)) {
+        $env:RUST_LOG = "info"
+    }
+    if ($UseWasapiAudio) {
+        $env:SUNRISE_AUDIO_SOURCE = "wasapi"
+    }
     $env:SUNRISE_H264_PATH = $H264Source
-    & $ExePath --config $ConfigPath *>&1 | Tee-Object -FilePath $LogPath
-} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source, $HostAddress
+    & $ExePath --config $ConfigPath *> $LogPath
+} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source, $HostAddress, ([bool]$UseWasapiAudio)
 
 try {
     Wait-Port -HostName "127.0.0.1" -Port 47989

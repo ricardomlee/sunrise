@@ -80,6 +80,12 @@ To reset the smoke-only config and run a real Moonlight stream long enough to ve
 
 The stream smoke waits for Moonlight's real RTSP handshake, audio/video stream startup, and video decoder initialization. It also fails if Moonlight reports audio decrypt errors.
 
+To run the same stream smoke with Windows WASAPI loopback audio instead of synthetic Opus silence:
+
+```powershell
+.\scripts\moonlight-smoke.ps1 -ResetConfig -RunStream -UseWasapiAudio
+```
+
 The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
 
 The smoke test uses local `ffmpeg.exe` to generate `target\moonlight-smoke\testsrc.h264`. To use your own Annex B H.264 elementary stream when running the daemon manually:
@@ -173,6 +179,23 @@ cargo run -p sunrise-daemon --features capture-windows
 
 The current QSV live source is an FFmpeg-backed bridge: Rust captures frames, feeds `h264_qsv`, reads Annex B H.264 from stdout, and reuses the normal RTP packetizer. A later native oneVPL/D3D11 source should remove this subprocess boundary.
 
+## Windows Audio Smoke Test
+
+The first live audio path is available behind the `audio-windows` feature. It captures the default Windows render endpoint through WASAPI loopback, encodes 20 ms stereo frames with bundled libopus, then feeds the normal encrypted audio RTP packetizer during RTSP streaming:
+
+```powershell
+cargo run -p sunrise-daemon --features audio-windows -- audio-smoke --packets 50
+```
+
+For live Moonlight testing:
+
+```powershell
+$env:SUNRISE_AUDIO_SOURCE = "wasapi"
+cargo run -p sunrise-daemon --features audio-windows
+```
+
+The current WASAPI path expects the default render endpoint mix format to be 48 kHz stereo float32 or int16. If the device uses a different sample rate or channel layout, sunrise logs the reason and falls back to synthetic Opus silence in RTSP until resampling/remixing is added.
+
 If native D3D11 NVENC cannot use DXGI duplication on a virtual display, `SUNRISE_VIDEO_SOURCE=native-nvenc` will fall back to an FFmpeg `h264_nvenc` live source instead of falling back to a file source. To force the capture side through Windows Graphics Capture:
 
 ```powershell
@@ -221,7 +244,7 @@ After `SETUP` and `PLAY`, sunrise binds the advertised UDP ports, waits for the 
 
 - `AnnexBVideoSource` reads an Annex B H.264 elementary stream from `SUNRISE_H264_PATH`, groups NAL units into access units, and exposes encoded frames.
 - `VideoPacketizer` emits Moonlight-style video RTP packets with the RTP extension flag, little-endian NV video headers, stream packet indices, and frame packet metadata.
-- `OpusSilenceSource` and `AudioPacketizer` provide the temporary audio path.
+- `OpusSilenceSource`, `WasapiLoopbackCapture`, `CapturedOpusSource`, and `AudioPacketizer` provide synthetic or live Opus audio.
 
 For file-backed smoke testing with a native build, select the file source explicitly:
 
@@ -242,9 +265,9 @@ This keeps the file-backed H.264 source as an explicit test source while leaving
 - H.264 encode smoke can produce Annex B output from captured frames through ffmpeg, including `h264_qsv` for Intel hardware validation.
 - RTSP video can explicitly use an FFmpeg-backed QSV live source with `SUNRISE_VIDEO_SOURCE=qsv`.
 - Native D3D11 NVENC can register captured textures directly with NVENC and uses a GPU BGRA conversion pass for HDR/10-bit desktop frames. It still needs more testing on NVIDIA headless and virtual-display hosts.
-- RTP audio is an unencrypted Opus-silence placeholder; real encrypted Opus audio is not implemented.
+- RTP audio is encrypted with the `/launch` RI key. The default source is still synthetic Opus silence unless `SUNRISE_AUDIO_SOURCE=wasapi` is selected with the `audio-windows` feature.
 - ENet control accepts connections, stores `/launch` `rikey`/`rikeyid`, and attempts AES-GCM control packet decryption before parsing payload headers for diagnostics. Required control replies, outbound control encryption, and input injection are not implemented.
-- Live video capture-to-RTSP exists through native NVENC or FFmpeg-backed hardware encoders, but it is still experimental on headless, virtual-display, and multi-adapter systems. Real audio capture is not implemented yet.
+- Live video capture-to-RTSP exists through native NVENC or FFmpeg-backed hardware encoders, but it is still experimental on headless, virtual-display, and multi-adapter systems. Live audio capture currently requires a 48 kHz stereo default render endpoint and still needs resampling/remixing.
 - The XML is plausible and easy to tweak, but may need field/value adjustments after testing against real Moonlight versions.
 
 ## Next Milestones
@@ -253,5 +276,5 @@ This keeps the file-backed H.264 source as an explicit test source while leaving
 2. Gate HTTPS APIs by paired client certificates.
 3. Validate the GameStream control nonce/key handling against real Moonlight packets, then add required control replies, outbound AES-GCM encryption, and Windows input injection.
 4. Harden live capture/NVENC across headless, virtual-display, and multi-adapter systems.
-5. Add real audio capture, Opus encoding, and GameStream audio encryption.
+5. Add WASAPI resampling/remixing and audio/video clock drift handling.
 6. Fill out GameStream control messages and input injection.

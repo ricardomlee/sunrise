@@ -19,10 +19,13 @@ use tracing::{debug, info, warn};
 use crate::{
     AppState, control, encoder,
     media::{
-        AnnexBVideoSource, AudioEncryptionKey, AudioPacketizer, OpusSilenceSource, VideoPacketizer,
-        VideoSource,
+        AnnexBVideoSource, AudioEncryptionKey, AudioPacketizer, AudioSource, OpusSilenceSource,
+        VideoPacketizer, VideoSource,
     },
 };
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+use crate::media::{CapturedOpusSource, LibOpusEncoder, WasapiLoopbackCapture};
 
 const SESSION_ID: &str = "DEADBEEFCAFE";
 const MAX_RTSP_REQUEST_BYTES: usize = 1024 * 1024;
@@ -579,22 +582,89 @@ async fn stream_audio_rtp(
     audio_key: Option<AudioEncryptionKey>,
 ) -> Result<()> {
     let client = wait_for_udp_ping(&socket, "audio").await?;
-    let mut source = OpusSilenceSource::new();
+    let mut source = audio_source_from_env();
     let mut packetizer = match audio_key {
         Some(key) => AudioPacketizer::with_encryption(Some(key)),
         None => AudioPacketizer::new(),
     };
     let mut ticker = interval(source.packet_interval());
 
-    info!(%client, encrypted = audio_key.is_some(), "starting synthetic audio RTP sender");
+    info!(
+        %client,
+        encrypted = audio_key.is_some(),
+        source = source.description(),
+        "starting audio RTP sender"
+    );
     loop {
         ticker.tick().await;
-        let packet = packetizer.packetize(&source.next_packet());
+        let packet = packetizer.packetize(&source.next_packet()?);
         socket
             .send_to(&packet, client)
             .await
             .context("failed to send audio RTP packet")?;
     }
+}
+
+fn audio_source_from_env() -> Box<dyn AudioSource> {
+    let audio_source = env::var("SUNRISE_AUDIO_SOURCE").ok();
+    match select_audio_source(audio_source.as_deref()) {
+        Ok(AudioSourceChoice::Wasapi) => match wasapi_audio_source() {
+            Ok(source) => source,
+            Err(err) => {
+                warn!(error = %err, "WASAPI audio source failed; falling back to Opus silence");
+                Box::new(OpusSilenceSource::new())
+            }
+        },
+        Ok(AudioSourceChoice::Silence) => Box::new(OpusSilenceSource::new()),
+        Err(err) => {
+            warn!(error = %err, "audio source selection failed; falling back to Opus silence");
+            Box::new(OpusSilenceSource::new())
+        }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "audio-windows"))]
+fn wasapi_audio_source() -> Result<Box<dyn AudioSource>> {
+    Ok(Box::new(CapturedOpusSource::new(
+        WasapiLoopbackCapture::new()?,
+        LibOpusEncoder::new()?,
+    )))
+}
+
+#[cfg(not(all(target_os = "windows", feature = "audio-windows")))]
+fn wasapi_audio_source() -> Result<Box<dyn AudioSource>> {
+    bail!("WASAPI audio requires Windows and the audio-windows feature")
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AudioSourceChoice {
+    Wasapi,
+    Silence,
+}
+
+fn select_audio_source(audio_source: Option<&str>) -> Result<AudioSourceChoice> {
+    match audio_source
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value)
+            if value.eq_ignore_ascii_case("wasapi")
+                || value.eq_ignore_ascii_case("loopback")
+                || value.eq_ignore_ascii_case("capture") =>
+        {
+            Ok(AudioSourceChoice::Wasapi)
+        }
+        Some(value) if value.eq_ignore_ascii_case("silence") => Ok(AudioSourceChoice::Silence),
+        Some(value) => bail!(
+            "unsupported SUNRISE_AUDIO_SOURCE={value:?}; expected wasapi, loopback, capture, or silence"
+        ),
+        None if wasapi_audio_source_available() => Ok(AudioSourceChoice::Wasapi),
+        None => Ok(AudioSourceChoice::Silence),
+    }
+}
+
+fn wasapi_audio_source_available() -> bool {
+    cfg!(all(target_os = "windows", feature = "audio-windows"))
 }
 
 async fn wait_for_udp_ping(socket: &UdpSocket, media: &str) -> Result<SocketAddr> {
@@ -762,6 +832,23 @@ mod tests {
     #[test]
     fn invalid_video_source_is_rejected() {
         assert!(select_video_source(Some("surprise"), None, None).is_err());
+    }
+
+    #[test]
+    fn audio_source_selection_accepts_wasapi_and_silence() {
+        assert_eq!(
+            select_audio_source(Some("wasapi")).unwrap(),
+            AudioSourceChoice::Wasapi
+        );
+        assert_eq!(
+            select_audio_source(Some("loopback")).unwrap(),
+            AudioSourceChoice::Wasapi
+        );
+        assert_eq!(
+            select_audio_source(Some("silence")).unwrap(),
+            AudioSourceChoice::Silence
+        );
+        assert!(select_audio_source(Some("radio")).is_err());
     }
 
     #[test]
