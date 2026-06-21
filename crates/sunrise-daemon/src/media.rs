@@ -1,5 +1,9 @@
 use std::{env, fs, time::Duration};
 
+use aes::{
+    Aes128,
+    cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
@@ -185,18 +189,74 @@ impl OpusSilenceSource {
 
 pub(crate) struct AudioPacketizer {
     sequence: u16,
+    encryption: Option<AudioEncryptionKey>,
 }
 
 impl AudioPacketizer {
     pub(crate) fn new() -> Self {
-        Self { sequence: 1 }
+        Self::with_encryption(None)
+    }
+
+    pub(crate) fn with_encryption(encryption: Option<AudioEncryptionKey>) -> Self {
+        Self {
+            sequence: 1,
+            encryption,
+        }
     }
 
     pub(crate) fn packetize(&mut self, packet: &EncodedAudioPacket) -> Vec<u8> {
-        let rtp = build_audio_rtp_packet(self.sequence, packet.timestamp, &packet.payload);
+        let sequence = self.sequence;
+        let payload = match self.encryption {
+            Some(key) => encrypt_audio_payload(&key, sequence, &packet.payload),
+            None => packet.payload.clone(),
+        };
+        let rtp = build_audio_rtp_packet(sequence, packet.timestamp, &payload);
         self.sequence = self.sequence.wrapping_add(1);
         rtp
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AudioEncryptionKey {
+    key_id: u32,
+    key: [u8; 16],
+}
+
+impl AudioEncryptionKey {
+    pub(crate) fn new(key_id: u32, key: [u8; 16]) -> Self {
+        Self { key_id, key }
+    }
+}
+
+fn encrypt_audio_payload(key: &AudioEncryptionKey, sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let cipher = Aes128::new(GenericArray::from_slice(&key.key));
+    let mut encrypted = pkcs7_pad(payload);
+    let mut previous = audio_iv(key.key_id, sequence);
+
+    for block in encrypted.chunks_exact_mut(16) {
+        for (byte, iv_byte) in block.iter_mut().zip(previous) {
+            *byte ^= iv_byte;
+        }
+        let block_array = GenericArray::from_mut_slice(block);
+        cipher.encrypt_block(block_array);
+        previous.copy_from_slice(block_array);
+    }
+
+    encrypted
+}
+
+fn pkcs7_pad(payload: &[u8]) -> Vec<u8> {
+    let padding_len = 16 - (payload.len() % 16);
+    let mut padded = Vec::with_capacity(payload.len() + padding_len);
+    padded.extend_from_slice(payload);
+    padded.extend(std::iter::repeat_n(padding_len as u8, padding_len));
+    padded
+}
+
+fn audio_iv(key_id: u32, sequence: u16) -> [u8; 16] {
+    let mut iv = [0_u8; 16];
+    iv[..4].copy_from_slice(&key_id.wrapping_add(u32::from(sequence)).to_be_bytes());
+    iv
 }
 
 pub(crate) fn split_annex_b_access_units(data: &[u8]) -> Vec<Vec<u8>> {
@@ -501,6 +561,7 @@ fn video_flags(first: bool, last: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::cipher::BlockDecrypt;
 
     #[test]
     fn splits_annex_b_h264_into_nal_units() {
@@ -619,5 +680,70 @@ mod tests {
         assert_eq!(&packet[2..4], &1_u16.to_be_bytes());
         assert_eq!(&packet[4..8], &0_u32.to_be_bytes());
         assert_eq!(&packet[RTP_AUDIO_HEADER_LEN..], &[0xF8, 0xFF, 0xFE]);
+    }
+
+    #[test]
+    fn encrypts_audio_rtp_payload_with_launch_ri_key() {
+        let key = AudioEncryptionKey::new(
+            0x1020_3040,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+        );
+        let mut packetizer = AudioPacketizer::with_encryption(Some(key));
+        let packet = packetizer.packetize(&EncodedAudioPacket {
+            payload: vec![0xF8, 0xFF, 0xFE],
+            timestamp: 0,
+        });
+
+        assert_eq!(
+            &packet[..RTP_AUDIO_HEADER_LEN],
+            &[
+                0x80,
+                RTP_AUDIO_PAYLOAD_TYPE,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0x52,
+                0x53,
+                0x41,
+                0x50
+            ]
+        );
+        assert_ne!(&packet[RTP_AUDIO_HEADER_LEN..], &[0xF8, 0xFF, 0xFE]);
+        assert_eq!(packet.len(), RTP_AUDIO_HEADER_LEN + 16);
+        assert_eq!(
+            decrypt_audio_payload_for_test(&key, 1, &packet[RTP_AUDIO_HEADER_LEN..]),
+            vec![0xF8, 0xFF, 0xFE]
+        );
+    }
+
+    fn decrypt_audio_payload_for_test(
+        key: &AudioEncryptionKey,
+        sequence: u16,
+        ciphertext: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(ciphertext.len() % 16, 0);
+        let cipher = Aes128::new(GenericArray::from_slice(&key.key));
+        let mut plaintext = ciphertext.to_vec();
+        let mut previous = audio_iv(key.key_id, sequence);
+
+        for block in plaintext.chunks_exact_mut(16) {
+            let current_ciphertext = <[u8; 16]>::try_from(&*block).unwrap();
+            cipher.decrypt_block(GenericArray::from_mut_slice(block));
+            for (byte, iv_byte) in block.iter_mut().zip(previous) {
+                *byte ^= iv_byte;
+            }
+            previous = current_ciphertext;
+        }
+
+        let padding_len = *plaintext.last().unwrap() as usize;
+        assert!((1..=16).contains(&padding_len));
+        plaintext.truncate(plaintext.len() - padding_len);
+        plaintext
     }
 }

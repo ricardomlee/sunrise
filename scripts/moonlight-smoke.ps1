@@ -6,7 +6,7 @@ param(
     [switch]$SkipPair,
     [switch]$ResetConfig,
     [switch]$RunStream,
-    [int]$StreamSeconds = 15
+    [int]$StreamSeconds = 25
 )
 
 $ErrorActionPreference = "Stop"
@@ -213,10 +213,35 @@ function Invoke-MoonlightStreamSmoke {
         -PassThru
 
     try {
-        Start-Sleep -Seconds $DurationSeconds
-        $stillRunning = $null -ne (Get-Process -Id $streamProcess.Id -ErrorAction SilentlyContinue)
-        if ($stillRunning) {
-            Stop-Process -Id $streamProcess.Id -Force -ErrorAction SilentlyContinue
+        $deadline = (Get-Date).AddSeconds($DurationSeconds)
+        $streamLog = ""
+        while ((Get-Date) -lt $deadline) {
+            $streamLog = ""
+            if (Test-Path -LiteralPath $StdoutPath) {
+                $streamLog += Get-Content -Raw -LiteralPath $StdoutPath
+            }
+            if (Test-Path -LiteralPath $StderrPath) {
+                $streamLog += Get-Content -Raw -LiteralPath $StderrPath
+            }
+
+            if ($streamLog -match "Failed to decrypt audio packet") {
+                throw "Moonlight reported audio decrypt failures. See $StdoutPath and $StderrPath"
+            }
+
+            if ($streamLog -match "Launch response" -and
+                $streamLog -match "Starting RTSP handshake" -and
+                $streamLog -match "Starting video stream" -and
+                $streamLog -match "Starting audio stream" -and
+                $streamLog -match "FFmpeg-based video decoder chosen") {
+                Write-Host "Moonlight stream smoke reached video decode."
+                return
+            }
+
+            if ($null -eq (Get-Process -Id $streamProcess.Id -ErrorAction SilentlyContinue)) {
+                break
+            }
+
+            Start-Sleep -Milliseconds 500
         }
 
         $streamLog = ""
@@ -227,17 +252,11 @@ function Invoke-MoonlightStreamSmoke {
             $streamLog += Get-Content -Raw -LiteralPath $StderrPath
         }
 
-        if ($streamLog -notmatch "Starting RTSP handshake" -or
-            $streamLog -notmatch "Starting video stream" -or
-            $streamLog -notmatch "FFmpeg-based video decoder chosen") {
-            throw "Moonlight stream did not reach video decode within $DurationSeconds seconds. See $StdoutPath and $StderrPath"
-        }
-
         if ($streamLog -match "Failed to decrypt audio packet") {
-            Write-Warning "Moonlight video decode started, but audio packets failed to decrypt. This is expected until Sunrise implements GameStream audio encryption."
+            throw "Moonlight reported audio decrypt failures. See $StdoutPath and $StderrPath"
         }
 
-        Write-Host "Moonlight stream smoke reached video decode."
+        throw "Moonlight stream did not reach RTSP audio/video decode within $DurationSeconds seconds. See $StdoutPath and $StderrPath"
     }
     finally {
         Stop-Process -Id $streamProcess.Id -Force -ErrorAction SilentlyContinue
@@ -444,12 +463,13 @@ finally {
 }
 
 $daemonJob = Start-Job -ScriptBlock {
-    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source)
+    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source, $HostAddress)
     $env:SUNRISE_PAIRING_PIN = $Pin
+    $env:SUNRISE_BIND_IP = $HostAddress
     $env:SUNRISE_VIDEO_SOURCE = "annex-b"
     $env:SUNRISE_H264_PATH = $H264Source
     & $ExePath --config $ConfigPath *>&1 | Tee-Object -FilePath $LogPath
-} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source
+} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source, $HostAddress
 
 try {
     Wait-Port -HostName "127.0.0.1" -Port 47989

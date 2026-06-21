@@ -18,7 +18,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     AppState, control, encoder,
-    media::{AnnexBVideoSource, AudioPacketizer, OpusSilenceSource, VideoPacketizer, VideoSource},
+    media::{
+        AnnexBVideoSource, AudioEncryptionKey, AudioPacketizer, OpusSilenceSource, VideoPacketizer,
+        VideoSource,
+    },
 };
 
 const SESSION_ID: &str = "DEADBEEFCAFE";
@@ -198,8 +201,12 @@ impl RtspState {
         }
 
         if let Some(socket) = session.audio_socket.clone() {
+            let audio_key = self
+                .control_crypto
+                .current_key()
+                .map(|key| AudioEncryptionKey::new(key.key_id_u32(), key.key_bytes()));
             session.stream_tasks.push(tokio::spawn(async move {
-                if let Err(err) = stream_audio_rtp(socket).await {
+                if let Err(err) = stream_audio_rtp(socket, audio_key).await {
                     warn!(error = %err, "audio RTP sender stopped");
                 }
             }));
@@ -567,13 +574,19 @@ fn native_nvenc_video_source_available() -> bool {
     cfg!(all(target_os = "windows", feature = "native-nvenc"))
 }
 
-async fn stream_audio_rtp(socket: Arc<UdpSocket>) -> Result<()> {
+async fn stream_audio_rtp(
+    socket: Arc<UdpSocket>,
+    audio_key: Option<AudioEncryptionKey>,
+) -> Result<()> {
     let client = wait_for_udp_ping(&socket, "audio").await?;
     let mut source = OpusSilenceSource::new();
-    let mut packetizer = AudioPacketizer::new();
+    let mut packetizer = match audio_key {
+        Some(key) => AudioPacketizer::with_encryption(Some(key)),
+        None => AudioPacketizer::new(),
+    };
     let mut ticker = interval(source.packet_interval());
 
-    info!(%client, "starting synthetic audio RTP sender");
+    info!(%client, encrypted = audio_key.is_some(), "starting synthetic audio RTP sender");
     loop {
         ticker.tick().await;
         let packet = packetizer.packetize(&source.next_packet());

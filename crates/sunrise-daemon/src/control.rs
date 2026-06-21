@@ -72,7 +72,7 @@ impl ControlCryptoState {
         info!("cleared GameStream control RI key");
     }
 
-    fn key(&self) -> Option<ControlSessionKey> {
+    pub(crate) fn current_key(&self) -> Option<ControlSessionKey> {
         self.current_key
             .read()
             .expect("control crypto lock poisoned")
@@ -162,6 +162,14 @@ impl ControlSessionKey {
             .with_context(|| format!("invalid rikeyid {rikeyid:?}"))?;
         let key = <[u8; 16]>::from_hex(rikey).context("rikey must be a 16-byte hex AES-128 key")?;
         Ok(Self { key_id, key })
+    }
+
+    pub(crate) fn key_id_u32(&self) -> u32 {
+        self.key_id as u32
+    }
+
+    pub(crate) fn key_bytes(&self) -> [u8; 16] {
+        self.key
     }
 }
 
@@ -315,7 +323,7 @@ pub(crate) enum ControlEvent {
 
 fn inspect_control_packet(data: &[u8], crypto: &ControlCryptoState) {
     if let Ok(packet) = parse_encrypted_control_packet(data) {
-        let maybe_key = crypto.key();
+        let maybe_key = crypto.current_key();
         if let Some(key) = maybe_key.as_ref() {
             match decrypt_control_packet(key, &packet).and_then(|decrypted| {
                 debug!(
@@ -920,6 +928,21 @@ mod tests {
                 .unwrap();
 
         assert_eq!(key.key_id, -1653680226);
+    }
+
+    #[test]
+    fn exposes_launch_ri_key_for_audio_encryption() {
+        let key =
+            ControlSessionKey::from_launch_query("-1", "00112233445566778899AABBCCDDEEFF").unwrap();
+
+        assert_eq!(key.key_id_u32(), u32::MAX);
+        assert_eq!(
+            key.key_bytes(),
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
     }
 
     #[test]

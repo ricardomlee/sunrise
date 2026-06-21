@@ -75,10 +75,10 @@ The script builds sunrise, starts the daemon with a test PIN, runs the real Moon
 To reset the smoke-only config and run a real Moonlight stream long enough to verify video decode:
 
 ```powershell
-.\scripts\moonlight-smoke.ps1 -ResetConfig -RunStream -StreamSeconds 12
+.\scripts\moonlight-smoke.ps1 -ResetConfig -RunStream
 ```
 
-The stream smoke currently treats Moonlight audio decrypt warnings as a known limitation because Sunrise still sends synthetic unencrypted Opus packets.
+The stream smoke waits for Moonlight's real RTSP handshake, audio/video stream startup, and video decoder initialization. It also fails if Moonlight reports audio decrypt errors.
 
 The smoke config uses a dedicated `sunrise-smoke` host name so Moonlight's local certificate cache does not collide with real hosts or previous experiments using the Windows computer name.
 
