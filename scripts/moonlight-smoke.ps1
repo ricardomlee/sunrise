@@ -1,8 +1,20 @@
+[CmdletBinding()]
 param(
     [string]$MoonlightPath = "C:\Program Files\Moonlight Game Streaming\Moonlight.exe",
     [string]$HostAddress = "127.0.0.1",
     [string]$Pin = "1234",
-    [string]$ConfigPath = "$PSScriptRoot\..\target\moonlight-smoke\sunrise.toml",
+    [string]$ConfigPath = "",
+    [string]$DaemonPath = "",
+    [string]$BuildTargetDir = "",
+    [ValidateSet("annex-b", "qsv", "native-nvenc")]
+    [string]$VideoSource = "annex-b",
+    [ValidateSet("", "dxgi", "wgc")]
+    [string]$CaptureBackend = "",
+    [int]$CaptureMonitor = -1,
+    [int]$VideoFps = 30,
+    [int]$VideoPreflightTimeoutSeconds = 20,
+    [switch]$SkipBuild,
+    [switch]$SkipVideoPreflight,
     [switch]$SkipPair,
     [switch]$ResetConfig,
     [switch]$RunStream,
@@ -57,6 +69,11 @@ function New-SmokeConfig {
         return
     }
 
+    $parent = Split-Path -Parent $Path
+    if (![string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+
     $uniqueId = ([guid]::NewGuid().ToString("N").Substring(0, 16)).ToUpperInvariant()
     $uuid = [guid]::NewGuid().ToString()
     $macBytes = [byte[]]::new(6)
@@ -101,6 +118,86 @@ function New-SmokeH264Source {
 
     if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $Path)) {
         throw "ffmpeg failed to generate $Path"
+    }
+}
+
+function Get-DaemonBuildFeatures {
+    $features = [System.Collections.Generic.List[string]]::new()
+    if ($UseWasapiAudio) {
+        $features.Add("audio-windows")
+    }
+    if ($VideoSource -eq "qsv") {
+        $features.Add("capture-windows")
+    }
+    elseif ($VideoSource -eq "native-nvenc") {
+        $features.Add("native-nvenc")
+    }
+    return $features
+}
+
+function Assert-VideoSourcePrerequisites {
+    if ($VideoSource -eq "annex-b") {
+        return
+    }
+
+    $ffmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($null -eq $ffmpeg) {
+        throw "$VideoSource live video smoke requires ffmpeg.exe on PATH"
+    }
+}
+
+function Set-VideoEnvironment {
+    param([string]$H264Path)
+
+    if ([string]::IsNullOrWhiteSpace($env:RUST_LOG)) {
+        $env:RUST_LOG = "info"
+    }
+    $env:SUNRISE_VIDEO_SOURCE = $VideoSource
+    $env:SUNRISE_VIDEO_FPS = [string]$VideoFps
+    if ($VideoSource -eq "annex-b") {
+        $env:SUNRISE_H264_PATH = $H264Path
+    }
+    else {
+        $env:SUNRISE_H264_PATH = $null
+    }
+    if (![string]::IsNullOrWhiteSpace($CaptureBackend)) {
+        $env:SUNRISE_CAPTURE_BACKEND = $CaptureBackend
+    }
+    if ($CaptureMonitor -ge 0) {
+        $env:SUNRISE_CAPTURE_MONITOR = [string]$CaptureMonitor
+    }
+}
+
+function Invoke-VideoSourcePreflight {
+    if ($SkipVideoPreflight -or $VideoSource -eq "annex-b") {
+        return
+    }
+
+    $outputPath = Join-Path $logDir "$VideoSource-preflight.h264"
+    Remove-Item -LiteralPath $outputPath -ErrorAction SilentlyContinue
+    Set-VideoEnvironment -H264Path $h264Source
+    Write-Host "Running $VideoSource live video preflight..."
+
+    if ($VideoSource -eq "qsv") {
+        $arguments = @("encode-smoke", "--encoder", "h264_qsv", "--frames", "15", "--fps", $VideoFps, "--output", $outputPath)
+    }
+    elseif ($VideoSource -eq "native-nvenc") {
+        $arguments = @("native-nvenc-smoke", "--frames", "15", "--fps", $VideoFps, "--output", $outputPath)
+    }
+
+    $process = Start-Process `
+        -FilePath $DaemonPath `
+        -ArgumentList $arguments `
+        -PassThru `
+        -NoNewWindow
+
+    Wait-Process -Id $process.Id -Timeout $VideoPreflightTimeoutSeconds -ErrorAction SilentlyContinue
+    if ($null -ne (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    if (!(Test-Path -LiteralPath $outputPath) -or (Get-Item -LiteralPath $outputPath).Length -le 0) {
+        throw "$VideoSource live video preflight failed before Moonlight streaming"
     }
 }
 
@@ -438,7 +535,18 @@ if (!(Test-Path -LiteralPath $MoonlightPath)) {
 }
 
 $repoRoot = Resolve-Path "$PSScriptRoot\.."
-$daemonPath = Join-Path $repoRoot "target\debug\sunrise-daemon.exe"
+$repoRoot = $repoRoot.Path
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Join-Path $repoRoot "target\moonlight-smoke\sunrise.toml"
+}
+if ([string]::IsNullOrWhiteSpace($DaemonPath)) {
+    if ([string]::IsNullOrWhiteSpace($BuildTargetDir)) {
+        $DaemonPath = Join-Path $repoRoot "target\debug\sunrise-daemon.exe"
+    }
+    else {
+        $DaemonPath = Join-Path (Join-Path $repoRoot $BuildTargetDir) "debug\sunrise-daemon.exe"
+    }
+}
 $logDir = Join-Path $repoRoot "target\moonlight-smoke"
 $daemonLog = Join-Path $logDir "sunrise-daemon.log"
 $pairLog = Join-Path $logDir "moonlight-pair.log"
@@ -453,34 +561,81 @@ if ($ResetConfig) {
     Remove-Item -LiteralPath $ConfigPath -ErrorAction SilentlyContinue
 }
 New-SmokeConfig -Path $ConfigPath
-New-SmokeH264Source -Path $h264Source
+if ($VideoSource -eq "annex-b") {
+    New-SmokeH264Source -Path $h264Source
+}
+Assert-VideoSourcePrerequisites
 
 Push-Location $repoRoot
 try {
-    $cargoArgs = @("build", "-p", "sunrise-daemon")
-    if ($UseWasapiAudio) {
-        $cargoArgs += @("--features", "audio-windows")
+    if (!$SkipBuild) {
+        $cargoArgs = @("build", "-p", "sunrise-daemon")
+        $features = Get-DaemonBuildFeatures
+        if ($features.Count -gt 0) {
+            $cargoArgs += @("--features", ($features -join ","))
+        }
+        if (![string]::IsNullOrWhiteSpace($BuildTargetDir)) {
+            $cargoArgs += @("--target-dir", $BuildTargetDir)
+        }
+        & cargo @cargoArgs
     }
-    & cargo @cargoArgs
 }
 finally {
     Pop-Location
 }
 
+$DaemonPath = (Resolve-Path $DaemonPath).Path
+Write-Host "Moonlight smoke video source: $VideoSource"
+Invoke-VideoSourcePreflight
+
 $daemonJob = Start-Job -ScriptBlock {
-    param($ExePath, $ConfigPath, $Pin, $LogPath, $H264Source, $HostAddress, $UseWasapiAudio)
+    param(
+        $ExePath,
+        $ConfigPath,
+        $Pin,
+        $LogPath,
+        $H264Source,
+        $HostAddress,
+        $UseWasapiAudio,
+        $VideoSource,
+        $CaptureBackend,
+        $CaptureMonitor,
+        $VideoFps
+    )
     $env:SUNRISE_PAIRING_PIN = $Pin
     $env:SUNRISE_BIND_IP = $HostAddress
-    $env:SUNRISE_VIDEO_SOURCE = "annex-b"
+    $env:SUNRISE_VIDEO_SOURCE = $VideoSource
+    $env:SUNRISE_VIDEO_FPS = [string]$VideoFps
     if ([string]::IsNullOrWhiteSpace($env:RUST_LOG)) {
         $env:RUST_LOG = "info"
     }
     if ($UseWasapiAudio) {
         $env:SUNRISE_AUDIO_SOURCE = "wasapi"
     }
-    $env:SUNRISE_H264_PATH = $H264Source
+    if ($VideoSource -eq "annex-b") {
+        $env:SUNRISE_H264_PATH = $H264Source
+    }
+    else {
+        $env:SUNRISE_H264_PATH = $null
+    }
+    if (![string]::IsNullOrWhiteSpace($CaptureBackend)) {
+        $env:SUNRISE_CAPTURE_BACKEND = $CaptureBackend
+    }
+    if ($CaptureMonitor -ge 0) {
+        $env:SUNRISE_CAPTURE_MONITOR = [string]$CaptureMonitor
+    }
     & $ExePath --config $ConfigPath *> $LogPath
-} -ArgumentList $daemonPath, $ConfigPath, $Pin, $daemonLog, $h264Source, $HostAddress, ([bool]$UseWasapiAudio)
+} -ArgumentList $DaemonPath,
+    $ConfigPath,
+    $Pin,
+    $daemonLog,
+    $h264Source,
+    $HostAddress,
+    ([bool]$UseWasapiAudio),
+    $VideoSource,
+    $CaptureBackend,
+    $CaptureMonitor,
+    $VideoFps
 
 try {
     Wait-Port -HostName "127.0.0.1" -Port 47989
